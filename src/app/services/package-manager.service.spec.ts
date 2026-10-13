@@ -2,8 +2,9 @@ import { TestBed } from '@angular/core/testing';
 import { of, skip, take, zip } from 'rxjs';
 import { Category } from '../models/category';
 import { PackageRowModel } from '../models/package-row-model';
+import { PackageOperationResult } from '../../../src-common/models/extension-message';
 import { PackageSource } from '../../../src-common/models/package-source';
-import { Project } from '../../../src-common/models/project';
+import { InstalledPackage, Project, Solution } from '../../../src-common/models/project';
 import { NuGetApiService } from './nuget-api.service';
 import { PackageManagerService } from './package-manager.service';
 import { VscodeService } from './vscode.service';
@@ -18,7 +19,7 @@ describe('PackageManagerService', () => {
   beforeEach(() => {
     nugetApiServiceMock = {
       search: jest.fn(),
-      searchByPackageIds: jest.fn(),
+      searchByPackageIds: jest.fn().mockReturnValue(of([])),
     };
     vscodeServiceMock = {
       postMessage: jest.fn(),
@@ -37,6 +38,32 @@ describe('PackageManagerService', () => {
 
   test('should be created', () => {
     expect(service).toBeTruthy();
+  });
+
+  test('dismissOperationResults clears the summary and rollback action', () => {
+    const result: PackageOperationResult = {
+      projectPath: 'App.csproj',
+      packageId: 'Package.One',
+      operation: 'add',
+      succeeded: false,
+      message: 'Install failed.',
+    };
+    let latestResults: PackageOperationResult[] = [];
+    let latestRollbackId: string | null = null;
+    const resultsSubscription = service.operationResults.subscribe((results) => {
+      latestResults = results;
+    });
+    const rollbackSubscription = service.rollbackId.subscribe((rollbackId) => {
+      latestRollbackId = rollbackId;
+    });
+
+    service.setOperationResults([result], 'rollback-id');
+    service.dismissOperationResults();
+
+    expect(latestResults).toEqual([]);
+    expect(latestRollbackId).toBeNull();
+    resultsSubscription.unsubscribe();
+    rollbackSubscription.unsubscribe();
   });
 
   test('changeCurrentSources should emit new sources', (done) => {
@@ -78,6 +105,118 @@ describe('PackageManagerService', () => {
     });
 
     service.changeCurrentCategory(expectedCategory);
+  });
+
+  test('updates query only direct package ids and excludes transitive-only updates', (done) => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [
+      { id: 'Package1', version: '0.9.0', packageLevel: 'direct' },
+      { id: 'Package3', version: '2.0.0', packageLevel: 'transitive' },
+    ];
+    solution.projects[1].packages = [{ id: 'Package3', version: '2.1.0', packageLevel: 'transitive' }];
+    const apiPackages = getMockApiPackages();
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    service.changeCurrentSolution(solution);
+    service.changeCurrentCategory(Category.Updates);
+    service.currentPackages.pipe(skip(2), take(1)).subscribe((packages) => {
+      expect(packages?.map((packageRow) => packageRow.id)).toEqual(['Package1']);
+      expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenLastCalledWith(
+        ['Package1'],
+        '',
+        false,
+        getMockPackageSource()
+      );
+      done();
+    });
+
+    service.queryForPackages('', false, getMockPackageSource());
+  });
+
+  test('consolidation filters to differing direct versions and ignores transitive-only or matching versions', () => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [
+      { id: 'Package1', version: '1.0.0', packageLevel: 'direct' },
+      { id: 'Package2', version: '1.0.0', packageLevel: 'direct' },
+      { id: 'Package3', version: '1.0.0', packageLevel: 'direct' },
+      { id: 'Package4', version: '1.0.0', packageLevel: 'transitive' },
+      { id: 'Package5', version: '1.0.0', packageLevel: 'direct' },
+      getFrameworkSpecificPackage('Package6', ['1.0.0', '2.0.0']),
+      getFrameworkSpecificPackage('Package7', ['1.0.0', '2.0.0']),
+    ];
+    solution.projects[1].packages = [
+      { id: 'package1', version: '2.0.0', packageLevel: 'direct' },
+      { id: 'Package2', version: '1.0.0', packageLevel: 'direct' },
+      { id: 'Package3', version: '2.0.0', packageLevel: 'transitive' },
+      { id: 'Package4', version: '2.0.0', packageLevel: 'transitive' },
+      getFrameworkSpecificPackage('Package6', ['2.0.0', '1.0.0']),
+      getFrameworkSpecificPackage('Package7', ['1.0.0', '3.0.0']),
+    ];
+    const apiPackages = ['Package1', 'Package2', 'Package3', 'Package4', 'Package5', 'Package6', 'Package7'].map((id) => ({
+      ...getMockApiPackages()[0],
+      id,
+    }));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    service.changeCurrentSolution(solution);
+    service.changeCurrentCategory(Category.Consolidate);
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    service.currentPackages.pipe(take(1)).subscribe((packages) => {
+      expect(packages?.map((packageRow) => packageRow.id)).toEqual(['Package1', 'Package7']);
+    });
+    expect(service.consolidationCount).toBe(2);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenLastCalledWith(
+      ['package1', 'Package2', 'Package3', 'Package5', 'Package6', 'Package7'],
+      '',
+      false,
+      getMockPackageSource()
+    );
+  });
+
+  test('falls back to Installed when Consolidate is no longer available in the active context', () => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [{ id: 'Package1', version: '1.0.0', packageLevel: 'direct' }];
+    solution.projects[1].packages = [{ id: 'Package1', version: '2.0.0', packageLevel: 'direct' }];
+    service.changeCurrentCategory(Category.Consolidate);
+    service.changeCurrentSolution(solution);
+    expect(service.consolidationCount).toBe(1);
+    expectCategory(service, Category.Consolidate);
+
+    solution.projects[1].packages[0].version = '1.0.0';
+    service.changeCurrentSolution(solution);
+    expect(service.consolidationCount).toBe(0);
+    expectCategory(service, Category.Installed);
+
+    service.changeCurrentCategory(Category.Consolidate);
+    service.changeCurrentProject(getMockCurrentProject());
+    expectCategory(service, Category.Installed);
+  });
+
+  test('update count is unique and based on direct packages only', (done) => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [
+      { id: 'Package1', version: '0.9.0', packageLevel: 'direct' },
+      { id: 'Package3', version: '2.0.0', packageLevel: 'transitive' },
+    ];
+    solution.projects[1].packages = [
+      { id: 'Package1', version: '0.8.0', packageLevel: 'direct' },
+      { id: 'Package2', version: '2.0.0', packageLevel: 'direct' },
+    ];
+    nugetApiServiceMock.search.mockReturnValue(of([]));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(getMockApiPackages()));
+    service.changeCurrentSolution(solution);
+    service.availableUpdateCount.pipe(skip(2), take(1)).subscribe((state) => {
+      expect(state).toEqual({ count: 1, loading: false });
+      expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledWith(
+        ['Package1', 'Package2'],
+        '',
+        false,
+        getMockPackageSource()
+      );
+      done();
+    });
+
+    service.queryForPackages('', false, getMockPackageSource());
   });
 
   test('changeCurrentProject should emit new project and set installed info', (done) => {
@@ -220,7 +359,59 @@ describe('PackageManagerService', () => {
 
     service.queryForPackages(query, prerelease, source);
 
-    expect(nugetApiServiceMock.search).toBeCalledWith(query, prerelease, source);
+    expect(nugetApiServiceMock.search).toHaveBeenCalledWith(query, prerelease, source);
+  });
+
+  test('queryForPackages restores the selected package from refreshed results', () => {
+    const source = getMockPackageSource();
+    const initialPackages = getMockApiPackages();
+    initialPackages[0].versions = [];
+    nugetApiServiceMock.search.mockReturnValue(of(initialPackages));
+    service.queryForPackages('', false, source);
+    service.changeCurrentSelectedPackage(initialPackages[0]);
+
+    const refreshedPackages = getMockApiPackages();
+    refreshedPackages[0].versions = [];
+    nugetApiServiceMock.search.mockReturnValue(of(refreshedPackages));
+
+    let selectedPackage: PackageRowModel | null = null;
+    let selectedPackageId: string | null = null;
+    service.currentSelectedPackage.subscribe((packageRow) => {
+      selectedPackage = packageRow;
+    });
+    service.currentSelectedPackageId.subscribe((packageId) => {
+      selectedPackageId = packageId;
+    });
+
+    service.queryForPackages('', false, source);
+
+    expect(selectedPackage).toBe(refreshedPackages[0]);
+    expect(selectedPackageId).toBe(refreshedPackages[0].id);
+  });
+
+  test('queryForPackages clears the selected package when it is no longer in the results', () => {
+    const source = getMockPackageSource();
+    const initialPackages = getMockApiPackages();
+    initialPackages[0].versions = [];
+    nugetApiServiceMock.search.mockReturnValue(of(initialPackages));
+    service.queryForPackages('', false, source);
+    service.changeCurrentSelectedPackage(initialPackages[0]);
+
+    nugetApiServiceMock.search.mockReturnValue(of([]));
+
+    let selectedPackage: PackageRowModel | null = initialPackages[0];
+    let selectedPackageId: string | null = initialPackages[0].id;
+    service.currentSelectedPackage.subscribe((packageRow) => {
+      selectedPackage = packageRow;
+    });
+    service.currentSelectedPackageId.subscribe((packageId) => {
+      selectedPackageId = packageId;
+    });
+
+    service.queryForPackages('', false, source);
+
+    expect(selectedPackage).toBeNull();
+    expect(selectedPackageId).toBeNull();
   });
 
   test('queryForPackages should set current packages with installed info on browse', (done) => {
@@ -253,7 +444,12 @@ describe('PackageManagerService', () => {
         expect(thirdPackage?.isInstalled).toBe(false);
         expect(thirdPackage?.isOutdated).toBe(false);
 
-        expect(nugetApiServiceMock.searchByPackageIds).toBeCalledTimes(0);
+        expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledWith(
+          ['Package1', 'Package2'],
+          '',
+          prerelease,
+          source
+        );
         done();
       } catch (error) {
         done(error);
@@ -304,7 +500,7 @@ describe('PackageManagerService', () => {
             expect(secondPackage?.isOutdated).toBe(false);
           }
 
-          expect(nugetApiServiceMock.search).toBeCalledTimes(0);
+          expect(nugetApiServiceMock.search).toHaveBeenCalledTimes(0);
           done();
         } catch (error) {
           done(error);
@@ -332,14 +528,15 @@ describe('PackageManagerService', () => {
 
     service.installPackage(packageToInstall, callingVersion);
 
-    expect(vscodeServiceMock.postMessage).toBeCalledTimes(1);
-    expect(vscodeServiceMock.postMessage).toBeCalledWith({
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledTimes(1);
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledWith(expect.objectContaining({
       command: 'add-package',
       projectName: currentProject.fsPath,
       packageId: packageToInstall.id,
       packageVersion: expectedVersion,
       packageSourceUrl: packageToInstall.sourceUrl,
-    });
+    }));
+    expect(vscodeServiceMock.postMessage.mock.calls[0][0].operationId).toEqual(expect.any(String));
   });
 
   test('installPackage should call postMessage with correct version', () => {
@@ -353,12 +550,150 @@ describe('PackageManagerService', () => {
 
     service.uninstallPackage(packageToUninstall);
 
-    expect(vscodeServiceMock.postMessage).toBeCalledTimes(1);
-    expect(vscodeServiceMock.postMessage).toBeCalledWith({
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledTimes(1);
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledWith(expect.objectContaining({
       command: 'remove-package',
       projectName: currentProject.fsPath,
       packageId: packageToUninstall.id,
-    });
+    }));
+  });
+
+  test('solution package results aggregate installed versions across projects', () => {
+    const apiPackages = getMockApiPackages();
+    const solution = getMockSolution();
+    solution.projects[0].packages = [{ id: 'Package1', version: '0.9.0', versionSource: 'central', packageLevel: 'direct' }];
+    solution.projects[1].packages = [{ id: 'Package1', version: '0.8.0', versionSource: 'override', packageLevel: 'transitive' }];
+    nugetApiServiceMock.search.mockReturnValue(of(apiPackages));
+
+    service.changeCurrentSolution(solution);
+    service.queryForPackages('', false, getMockPackageSource());
+
+    const aggregatedPackage = apiPackages[0];
+    expect(aggregatedPackage.isInstalled).toBe(true);
+    expect(aggregatedPackage.installedVersion).toBe('Varies by project');
+    expect(aggregatedPackage.isOutdated).toBe(true);
+    expect(aggregatedPackage.versionSource).toBe('mixed');
+    expect(aggregatedPackage.packageLevel).toBe('mixed');
+    expect(aggregatedPackage.solutionProjectStates).toEqual([
+      expect.objectContaining({ projectPath: solution.projects[0].fsPath, installedVersion: '0.9.0', versionSource: 'central' }),
+      expect.objectContaining({ projectPath: solution.projects[1].fsPath, installedVersion: '0.8.0', versionSource: 'override' }),
+    ]);
+  });
+
+  test('solution installs target selected projects and pass the CPM exception preference', () => {
+    const solution = getMockSolution();
+    const packageToInstall = getMockApiPackages()[0];
+    service.changeCurrentSolution(solution);
+    service.selectProjectsForPackage(packageToInstall.id, [solution.projects[1].fsPath]);
+    vscodeServiceMock.postMessage.mockClear();
+
+    service.installPackage(packageToInstall, '0.8.0');
+
+    expect(vscodeServiceMock.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+      command: 'add-package-to-projects',
+      projectPaths: [solution.projects[1].fsPath],
+      packageId: packageToInstall.id,
+      packageVersion: '0.8.0',
+      packageSourceUrl: packageToInstall.sourceUrl,
+      includeCpmExceptions: false,
+    }));
+    const firstOperationId = vscodeServiceMock.postMessage.mock.calls[0][0].operationId;
+    service.completePackageOperation(firstOperationId);
+
+    service.installPackage(packageToInstall, undefined, undefined, true);
+    expect(vscodeServiceMock.postMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        command: 'add-package-to-projects',
+        includeCpmExceptions: true,
+      })
+    );
+  });
+
+  test('solution keeps project selections scoped to each package', () => {
+    const solution = getMockSolution();
+    service.changeCurrentSolution(solution);
+    service.selectProjectsForPackage('Package1', [solution.projects[0].fsPath]);
+    service.selectProjectsForPackage('Package2', [solution.projects[1].fsPath]);
+
+    expect(service.selectedProjectsForPackage('Package1')).toEqual([solution.projects[0].fsPath]);
+    expect(service.selectedProjectsForPackage('Package2')).toEqual([solution.projects[1].fsPath]);
+    expect(service.selectedProjectsForPackage('Package3')).toEqual([]);
+  });
+
+  test('solution install does nothing until projects are checked for that package', () => {
+    service.changeCurrentSolution(getMockSolution());
+    vscodeServiceMock.postMessage.mockClear();
+
+    service.installPackage(getMockApiPackages()[0]);
+
+    expect(vscodeServiceMock.postMessage).not.toHaveBeenCalled();
+  });
+
+  test('solution uninstall targets selected projects where the package is installed', () => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [{ id: 'Package1', version: '0.9.0' }];
+    solution.projects[1].packages = [{ id: 'Package1', version: '0.8.0', packageLevel: 'transitive' }];
+    service.changeCurrentSolution(solution);
+    service.selectProjectsForPackage('Package1', solution.projects.map((project) => project.fsPath));
+    vscodeServiceMock.postMessage.mockClear();
+
+    service.uninstallPackage(getMockApiPackages()[0]);
+
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      command: 'remove-package-from-projects',
+      projectPaths: [solution.projects[0].fsPath],
+      packageId: 'Package1',
+    }));
+  });
+
+  test('keeps package updates busy until the batch completes', () => {
+    service.changeCurrentProject(getMockCurrentProject());
+    vscodeServiceMock.postMessage.mockClear();
+    service.installPackages(getMockApiPackages());
+
+    expect(service.isPackageOperationInProgress).toBe(true);
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledTimes(1);
+    expect(vscodeServiceMock.postMessage.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        command: 'update-packages-batch',
+        updates: [
+          expect.objectContaining({
+            projectPaths: ['/path/on/disk'],
+            packageId: 'Package1',
+            packageVersion: '1.0.0',
+          }),
+        ],
+      })
+    );
+
+    const operationId = vscodeServiceMock.postMessage.mock.calls[0][0].operationId;
+    service.installPackage(getMockApiPackages()[0]);
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledTimes(1);
+
+    service.completePackageOperation(operationId);
+    expect(service.isPackageOperationInProgress).toBe(false);
+  });
+
+  test('solution bulk updates target direct outdated references across projects by default', () => {
+    const solution = getMockSolution();
+    solution.projects[0].packages = [{ id: 'Package1', version: '0.9.0', packageLevel: 'direct' }];
+    solution.projects[1].packages = [
+      { id: 'Package1', version: '0.8.0', packageLevel: 'transitive' },
+      { id: 'Package2', version: '1.0.0', packageLevel: 'direct' },
+    ];
+    service.changeCurrentSolution(solution);
+
+    service.installPackages([getMockApiPackages()[0], getMockApiPackages()[1]]);
+
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: 'update-packages-batch',
+        updates: [
+          expect.objectContaining({ packageId: 'Package1', projectPaths: [solution.projects[0].fsPath] }),
+          expect.objectContaining({ packageId: 'Package2', projectPaths: [solution.projects[1].fsPath] }),
+        ],
+      })
+    );
   });
 
   function getMockApiPackages(): PackageRowModel[] {
@@ -425,6 +760,19 @@ describe('PackageManagerService', () => {
     };
   }
 
+  function getMockSolution(): Solution {
+    return {
+      name: 'Test.slnx',
+      fsPath: '/path/on/disk/Test.slnx',
+      projects: [
+        { name: 'Project1', fsPath: '/path/on/disk/Project1.csproj', packages: [], managePackageVersionsCentrally: true },
+        { name: 'Project2', fsPath: '/path/on/disk/Project2.csproj', packages: [], managePackageVersionsCentrally: true },
+      ],
+      unsupportedProjects: [],
+      loadFailures: [],
+    };
+  }
+
   function getMockPackageSource(): PackageSource {
     return {
       name: 'nuget.org',
@@ -432,4 +780,26 @@ describe('PackageManagerService', () => {
       authorizationHeader: undefined,
     };
   }
+
+  function expectCategory(packageManager: PackageManagerService, expectedCategory: Category): void {
+    let category: Category | undefined;
+    packageManager.currentCategory.pipe(take(1)).subscribe((value) => {
+      category = value;
+    });
+    expect(category).toBe(expectedCategory);
+  }
 });
+
+function getFrameworkSpecificPackage(id: string, versions: string[]): InstalledPackage {
+  return {
+    id,
+    version: 'Varies by target framework',
+    packageLevel: 'direct',
+    targetFrameworkVersions: versions.map((version, index) => ({
+      targetFramework: `net${9 + index}.0`,
+      version,
+      versionSource: 'central',
+      packageLevel: 'direct',
+    })),
+  };
+}

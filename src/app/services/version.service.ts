@@ -12,12 +12,12 @@ export class VersionService {
       // try comparing the versions directly
       return rcompare(v1, v2, { loose: true });
     } catch {
-      const tryGetRevision = (version: string): Number => {
+      const tryGetRevision = (version: string): number => {
         const revision = version.split('.').map(Number).pop();
         return revision || 0;
       };
 
-      const reverseCompareNumbers = (n1: Number, n2: Number): 0 | 1 | -1 => {
+      const reverseCompareNumbers = (n1: number, n2: number): 0 | 1 | -1 => {
         return n1 < n2 ? 1 : n1 > n2 ? -1 : 0;
       };
 

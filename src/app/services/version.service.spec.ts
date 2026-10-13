@@ -50,7 +50,7 @@ describe('VersionService', () => {
         throw new Error(); // First throw error to go to coercing
       })
       .mockReturnValue(0); // Then assume semver parts are equal to compare revision
-    mockCoerce.mockImplementation((_) => <SemVer>(<unknown>'1.0.0'));
+    mockCoerce.mockImplementation(() => <SemVer>(<unknown>'1.0.0'));
 
     const result = service.compareSemVers(v1, v2);
 

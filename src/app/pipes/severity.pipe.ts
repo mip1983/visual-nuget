@@ -1,7 +1,8 @@
 import { Pipe, PipeTransform } from '@angular/core';
 
 @Pipe({
-  name: 'severity',
+    name: 'severity',
+    standalone: false
 })
 export class SeverityPipe implements PipeTransform {
   transform(value: string): unknown {

@@ -9,34 +9,46 @@ export default class UiPanel {
   private static readonly viewType = 'angular';
 
   private readonly panel: vscode.WebviewPanel;
-  private readonly projectFileUri: vscode.Uri;
+  private readonly context: { type: 'project' | 'solution'; filePath: string };
+  private readonly panelKey: string;
   private readonly extensionPath: string;
   private readonly builtAppFolder: string;
   private readonly webviewMessageHandler: WebviewMessageHandler;
   private disposables: vscode.Disposable[] = [];
 
-  public static createOrShow(extensionPath: string, projectFileUri: vscode.Uri) {
+  public static createOrShow(extensionPath: string, resourceUri: vscode.Uri, type: 'project' | 'solution' = 'project') {
     const column = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : undefined;
 
-    const projectFilePath = projectFileUri.path;
+    const filePath = resourceUri.fsPath;
+    const panelKey = `${type}:${filePath}`;
 
-    const existingPanel = UiPanel.currentPanels[projectFilePath];
+    const existingPanel = UiPanel.currentPanels[panelKey];
 
     if (existingPanel) {
       existingPanel.panel.reveal(column);
     } else {
-      UiPanel.currentPanels[projectFilePath] = new UiPanel(extensionPath, column || vscode.ViewColumn.One, projectFileUri);
+      UiPanel.currentPanels[panelKey] = new UiPanel(extensionPath, column || vscode.ViewColumn.One, {
+        type,
+        filePath,
+        panelKey,
+      });
     }
     return UiPanel.currentPanels;
   }
 
-  private constructor(extensionPath: string, column: vscode.ViewColumn, projectFileUri: vscode.Uri) {
+  private constructor(
+    extensionPath: string,
+    column: vscode.ViewColumn,
+    context: { type: 'project' | 'solution'; filePath: string; panelKey: string }
+  ) {
     this.extensionPath = extensionPath;
     this.builtAppFolder = 'dist';
-    this.projectFileUri = projectFileUri;
+    this.context = context;
+    this.panelKey = context.panelKey;
 
-    const projectName = path.basename(this.projectFileUri.path);
-    this.panel = vscode.window.createWebviewPanel(UiPanel.viewType, `Visual NuGet: ${projectName}`, column, {
+    const resourceName = path.basename(this.context.filePath);
+    const title = this.context.type === 'solution' ? `Visual NuGet Solution: ${resourceName}` : `Visual NuGet: ${resourceName}`;
+    this.panel = vscode.window.createWebviewPanel(UiPanel.viewType, title, column, {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.file(path.join(this.extensionPath, this.builtAppFolder))],
       retainContextWhenHidden: true,
@@ -47,11 +59,14 @@ export default class UiPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
     // initialize the message handler for the communication between the webview and the extension
-    this.webviewMessageHandler = new WebviewMessageHandler(this.panel.webview, this.projectFileUri.fsPath);
+    this.webviewMessageHandler = new WebviewMessageHandler(this.panel.webview, {
+      type: this.context.type,
+      filePath: this.context.filePath,
+    });
   }
 
   private dispose() {
-    UiPanel.currentPanels[this.projectFileUri.path] = undefined;
+    UiPanel.currentPanels[this.panelKey] = undefined;
 
     this.webviewMessageHandler.dispose();
 

@@ -150,19 +150,15 @@ export class NuGetApiService {
       return null;
     }
 
-    let filteredRegistrationLeafs: RegistrationLeaf[] = [];
     // registration leafs contain prerelease versions by default
-    if (includePrerelease) {
-      filteredRegistrationLeafs = registrationLeafs;
-    } else {
-      // filter out prerelease versions
-      filteredRegistrationLeafs = registrationLeafs.filter(
-        (registrationLeaf: RegistrationLeaf): boolean => prerelease(registrationLeaf.catalogEntry.version) === null
-      );
-    }
+    const prereleaseFilteredLeafs = includePrerelease
+      ? registrationLeafs
+      : registrationLeafs.filter(
+          (registrationLeaf: RegistrationLeaf): boolean => prerelease(registrationLeaf.catalogEntry.version) === null
+        );
 
     // filter out unlisted packages, compare with false explicitly since undefined means it's true/listed
-    filteredRegistrationLeafs = filteredRegistrationLeafs.filter(
+    const filteredRegistrationLeafs = prereleaseFilteredLeafs.filter(
       (registrationLeaf: RegistrationLeaf): boolean => registrationLeaf.catalogEntry.listed !== false
     );
 

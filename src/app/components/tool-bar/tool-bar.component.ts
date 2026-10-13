@@ -1,4 +1,4 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { UntypedFormBuilder, UntypedFormGroup } from '@angular/forms';
 import { debounceTime } from 'rxjs/operators';
 import { NUGET_ORG } from 'src/app/models/constants';
@@ -9,9 +9,11 @@ import { BaseComponent } from '../base-component';
 import { VscodeService } from 'src/app/services/vscode.service';
 
 @Component({
-  selector: 'app-tool-bar',
-  templateUrl: './tool-bar.component.html',
-  styleUrls: ['./tool-bar.component.scss'],
+    selector: 'app-tool-bar',
+    templateUrl: './tool-bar.component.html',
+    styleUrls: ['./tool-bar.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class ToolBarComponent extends BaseComponent implements OnInit {
   public packageSources: PackageSource[] = [];
@@ -24,6 +26,7 @@ export class ToolBarComponent extends BaseComponent implements OnInit {
 
   ngOnInit(): void {
     this.listenForSourcesChanges();
+    this.listenForProjectChanges();
   }
 
   public refresh(): void {
@@ -48,6 +51,23 @@ export class ToolBarComponent extends BaseComponent implements OnInit {
         }
 
         this.initForm();
+      })
+    );
+  }
+
+  private listenForProjectChanges(): void {
+    this.subscriptions.add(
+      this.packageManager.currentProject.subscribe((project) => {
+        if (project && this.searchForm) {
+          this.refresh();
+        }
+      })
+    );
+    this.subscriptions.add(
+      this.packageManager.currentSolution.subscribe((solution) => {
+        if (solution && this.searchForm) {
+          this.refresh();
+        }
       })
     );
   }
