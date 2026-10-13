@@ -18,6 +18,7 @@ export class PackageListComponent extends BaseComponent implements OnInit {
   private currentSelectedCategory: Category = Category.Browse;
 
   public packages: PackageRowModel[] | null = null;
+  public loadError: string | null = null;
   public isSolution = false;
   public buildAfterRestore = false;
 
@@ -58,6 +59,11 @@ export class PackageListComponent extends BaseComponent implements OnInit {
     this.listenForCurrentPackages();
     this.listenForCurrentSelectedPackage();
     this.listenForSelectedCategory();
+    this.subscriptions.add(
+      this.packageManager.currentPackagesError.subscribe((error) => {
+        this.loadError = error;
+      })
+    );
     this.subscriptions.add(
       this.packageManager.currentSolution.subscribe((solution) => {
         this.isSolution = solution !== null;

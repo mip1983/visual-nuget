@@ -85,9 +85,19 @@ export class PackageManagerService {
     return this._currentPackages.asObservable();
   }
 
+  private _currentPackagesError = new BehaviorSubject<string | null>(null);
+  public get currentPackagesError(): Observable<string | null> {
+    return this._currentPackagesError.asObservable();
+  }
+
   private _currentSelectedPackage = new BehaviorSubject<PackageRowModel | null>(null);
   public get currentSelectedPackage(): Observable<PackageRowModel | null> {
     return this._currentSelectedPackage.asObservable();
+  }
+
+  private _currentSelectedPackageError = new BehaviorSubject<string | null>(null);
+  public get currentSelectedPackageError(): Observable<string | null> {
+    return this._currentSelectedPackageError.asObservable();
   }
 
   private _currentSelectedPackageId = new BehaviorSubject<string | null>(null);
@@ -117,6 +127,8 @@ export class PackageManagerService {
     this._currentSelectedPackage.next(null);
     this._currentSelectedPackageId.next(selectedPackageId);
     this._currentPackages.next(null);
+    this._currentPackagesError.next(null);
+    this._currentSelectedPackageError.next(null);
 
     this._currentSource = source;
     this._currentPrerelease = prerelease;
@@ -125,8 +137,12 @@ export class PackageManagerService {
     const currentCategory = this._currentCategory.value;
 
     if (currentCategory === Category.Browse) {
-      this.nugetService.search(query, prerelease, source).subscribe((packageRowModels: PackageRowModel[]) => {
-        this.setCurrentPackages(packageRowModels);
+      this.nugetService.search(query, prerelease, source).subscribe({
+        next: (packageRowModels: PackageRowModel[]) => {
+          this._currentPackagesError.next(null);
+          this.setCurrentPackages(packageRowModels);
+        },
+        error: () => this.setPackageQueryError(),
       });
     } else {
       const currentInstalledPackageIds =
@@ -136,9 +152,13 @@ export class PackageManagerService {
       if (currentInstalledPackageIds.length) {
         this.nugetService
           .searchByPackageIds(currentInstalledPackageIds, query, prerelease, source)
-          .subscribe((packageRowModels: PackageRowModel[]) => {
-            packageRowModels = this.filterResultsToMatchCategory(packageRowModels);
-            this.setCurrentPackages(packageRowModels);
+          .subscribe({
+            next: (packageRowModels: PackageRowModel[]) => {
+              this._currentPackagesError.next(null);
+              packageRowModels = this.filterResultsToMatchCategory(packageRowModels);
+              this.setCurrentPackages(packageRowModels);
+            },
+            error: () => this.setPackageQueryError(),
           });
       } else {
         this.setCurrentPackages([]);
@@ -232,6 +252,7 @@ export class PackageManagerService {
   }
 
   public changeCurrentSelectedPackage(selectedPackage: PackageRowModel | null): void {
+    this._currentSelectedPackageError.next(null);
     // set the current selected package id so that the list highlights it
     this._currentSelectedPackageId.next(selectedPackage?.id ?? null);
     // set the current selected package to null to clear the details pane
@@ -242,9 +263,25 @@ export class PackageManagerService {
       this._currentSelectedPackage.next(selectedPackage);
     } else if (this._currentSource) {
       // else query the api for the package metadata and use the versions from the result
-      this.nugetService.searchByPackageIds([selectedPackage?.id], '', this._currentPrerelease, this._currentSource).subscribe((results) => {
-        selectedPackage.versions = results[0].versions;
-        this._currentSelectedPackage.next(selectedPackage);
+      this.nugetService.searchByPackageIds([selectedPackage.id], '', this._currentPrerelease, this._currentSource).subscribe({
+        next: (results) => {
+          const packageWithVersions = results.find((result) => result.id.toLowerCase() === selectedPackage.id.toLowerCase());
+          if (!packageWithVersions) {
+            this._currentSelectedPackageError.next(
+              'Package details were not returned by the selected source. Check the source settings and retry.'
+            );
+            return;
+          }
+          selectedPackage.versions = packageWithVersions.versions;
+          selectedPackage.vulnerabilities = packageWithVersions.vulnerabilities ?? selectedPackage.vulnerabilities;
+          selectedPackage.deprecation = packageWithVersions.deprecation ?? selectedPackage.deprecation;
+          this._currentSelectedPackage.next(selectedPackage);
+        },
+        error: () => {
+          this._currentSelectedPackageError.next(
+            'Package details could not be loaded from the selected source. Check the source settings or connection and retry.'
+          );
+        },
       });
     }
   }
@@ -423,6 +460,14 @@ export class PackageManagerService {
 
   private packageSelectionKey(solution: Solution, packageId: string): string {
     return `${solution.fsPath.toLowerCase()}|${packageId.toLowerCase()}`;
+  }
+
+  private setPackageQueryError(): void {
+    const message = 'Packages could not be loaded from the selected source. Check the source settings or connection, then refresh.';
+    this._currentPackagesError.next(message);
+    if (this._currentSelectedPackageId.value) {
+      this._currentSelectedPackageError.next(message);
+    }
   }
 
   private postPackageOperation(message: UIMessage): void {

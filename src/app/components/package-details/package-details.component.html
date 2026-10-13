@@ -1,5 +1,7 @@
 @if (isLoading) {
   <app-loading-spinner></app-loading-spinner>
+} @else if (loadError) {
+  <div class="package-load-error" role="alert">{{ loadError }}</div>
 } @else if (package) {
   <div class="package-details">
     <div class="header">
@@ -136,7 +138,10 @@
       </button>
     </div>
     @if (selectedVersionObject) {
-      <app-package-details-vulnerabilities [vulnerabilities]="selectedVersionObject.vulnerabilities"></app-package-details-vulnerabilities>
+      <app-package-details-vulnerabilities
+        [vulnerabilities]="selectedVersionVulnerabilities"
+        [deprecation]="selectedVersionDeprecation"
+      ></app-package-details-vulnerabilities>
       <div class="description">
         <p class="label">Description</p>
         <pre class="description-text">{{ selectedVersionObject.description }}</pre>

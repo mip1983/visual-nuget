@@ -36,3 +36,9 @@ jobs:
 
       - run: npm test
         if: runner.os != 'Linux'
+
+      - run: xvfb-run -a npm run test:extension
+        if: runner.os == 'Linux'
+
+      - run: npm run test:extension
+        if: runner.os != 'Linux'

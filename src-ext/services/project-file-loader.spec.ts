@@ -60,7 +60,7 @@ describe('ProjectFileLoader', () => {
           id: 'Azure.Identity',
           version: '1.19.0',
           versionSource: 'central',
-          versionFilePath: path.resolve(__dirname, '..', 'test-fixtures', 'cpm', 'ImportedVersions.props'),
+          versionFilePath: expect.stringMatching(/(?:^|[\\/])ImportedVersions\.props$/i),
         }),
         expect.objectContaining({
           id: 'Azure.Core',

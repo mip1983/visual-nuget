@@ -8,17 +8,30 @@ TargetFramework=net10.0
 
 [properties]
 AssemblyName=test
+AssemblyName=test
+BaseIntermediateOutputPath=<PATH>obj/
 BaseIntermediateOutputPath=<PATH>obj/
 BaseOutputPath=bin/
+BaseOutputPath=bin/
+MaxSupportedLangVersion=14.0
 MaxSupportedLangVersion=14.0
 OutputType=Exe
+OutputType=Exe
+ProjectAssetsFile=<PATH>obj/project.assets.json
 ProjectAssetsFile=<PATH>obj/project.assets.json
 RootNamespace=test
+RootNamespace=test
+TargetFramework=net10.0
 TargetFramework=net10.0
 TargetFrameworkIdentifier=.NETCoreApp
+TargetFrameworkIdentifier=.NETCoreApp
+TargetFrameworkVersion=v10.0
 TargetFrameworkVersion=v10.0
 TargetPath=<PATH>bin/Debug/net10.0/test.dll
+TargetPath=<PATH>bin/Debug/net10.0/test.dll
 TargetRefPath=<PATH>obj/Debug/net10.0/ref/test.dll
+TargetRefPath=<PATH>obj/Debug/net10.0/ref/test.dll
+TemporaryDependencyNodeTargetIdentifier=net10.0
 TemporaryDependencyNodeTargetIdentifier=net10.0
 
 [commandLineArguments]
@@ -51,7 +64,6 @@ TemporaryDependencyNodeTargetIdentifier=net10.0
 [sourceFiles]
 obj/Debug/net10.0/
  .NETCoreApp,Version=v10.0.AssemblyAttributes.cs
- CpmApp.AssemblyInfo.cs
  CpmApp.GlobalUsings.g.cs
 Program.cs
 Test.cs
@@ -63,7 +75,7 @@ Microsoft.NETCore.App.Ref
 [metadataReferences]
 <NUGET>/
  azure.core/1.62.0/lib/net10.0/Azure.Core.dll
- azure.identity/1.19.0/lib/net10.0/Azure.Identity.dll
+ azure.identity/1.21.0/lib/net10.0/Azure.Identity.dll
  microsoft.bcl.asyncinterfaces/10.0.10/lib/netstandard2.1/Microsoft.Bcl.AsyncInterfaces.dll
  microsoft.identity.client.extensions.msal/4.84.2/lib/net8.0/Microsoft.Identity.Client.Extensions.Msal.dll
  microsoft.identity.client/4.84.2/lib/net8.0/Microsoft.Identity.Client.dll

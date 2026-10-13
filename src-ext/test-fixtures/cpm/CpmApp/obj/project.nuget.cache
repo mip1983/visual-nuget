@@ -1,11 +1,11 @@
 {
   "version": 2,
-  "dgSpecHash": "J0b8dVQDulA=",
+  "dgSpecHash": "X2PsD3oWBQA=",
   "success": true,
-  "projectFilePath": "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
+  "projectFilePath": "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
   "expectedPackageFiles": [
     "D:\\MatthewPaul\\.nuget\\packages\\azure.core\\1.62.0\\azure.core.1.62.0.nupkg.sha512",
-    "D:\\MatthewPaul\\.nuget\\packages\\azure.identity\\1.19.0\\azure.identity.1.19.0.nupkg.sha512",
+    "D:\\MatthewPaul\\.nuget\\packages\\azure.identity\\1.21.0\\azure.identity.1.21.0.nupkg.sha512",
     "D:\\MatthewPaul\\.nuget\\packages\\microsoft.bcl.asyncinterfaces\\10.0.10\\microsoft.bcl.asyncinterfaces.10.0.10.nupkg.sha512",
     "D:\\MatthewPaul\\.nuget\\packages\\microsoft.extensions.configuration\\10.0.12\\microsoft.extensions.configuration.10.0.12.nupkg.sha512",
     "D:\\MatthewPaul\\.nuget\\packages\\microsoft.extensions.configuration.abstractions\\10.0.12\\microsoft.extensions.configuration.abstractions.10.0.12.nupkg.sha512",
@@ -35,10 +35,10 @@
     "D:\\MatthewPaul\\.nuget\\packages\\system.text.encodings.web\\10.0.11\\system.text.encodings.web.10.0.11.nupkg.sha512",
     "D:\\MatthewPaul\\.nuget\\packages\\system.text.json\\10.0.11\\system.text.json.10.0.11.nupkg.sha512",
     "D:\\MatthewPaul\\.nuget\\packages\\system.text.json\\10.0.12\\system.text.json.10.0.12.nupkg.sha512",
-    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.netcore.app.ref\\9.0.20\\microsoft.netcore.app.ref.9.0.20.nupkg.sha512",
-    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.windowsdesktop.app.ref\\9.0.20\\microsoft.windowsdesktop.app.ref.9.0.20.nupkg.sha512",
-    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.aspnetcore.app.ref\\9.0.20\\microsoft.aspnetcore.app.ref.9.0.20.nupkg.sha512",
-    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.netcore.app.host.win-x64\\9.0.20\\microsoft.netcore.app.host.win-x64.9.0.20.nupkg.sha512"
+    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.netcore.app.ref\\9.0.21\\microsoft.netcore.app.ref.9.0.21.nupkg.sha512",
+    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.windowsdesktop.app.ref\\9.0.21\\microsoft.windowsdesktop.app.ref.9.0.21.nupkg.sha512",
+    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.aspnetcore.app.ref\\9.0.21\\microsoft.aspnetcore.app.ref.9.0.21.nupkg.sha512",
+    "D:\\MatthewPaul\\.nuget\\packages\\microsoft.netcore.app.host.win-x64\\9.0.21\\microsoft.netcore.app.host.win-x64.9.0.21.nupkg.sha512"
   ],
   "logs": []
 }

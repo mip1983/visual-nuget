@@ -1,5 +1,5 @@
 import { Component, Input, ChangeDetectionStrategy } from '@angular/core';
-import { Vulnerability } from 'src/app/models/package-meta';
+import { PackageDeprecation, Vulnerability } from 'src/app/models/package-meta';
 
 @Component({
     selector: 'app-package-details-vulnerabilities',
@@ -11,4 +11,7 @@ import { Vulnerability } from 'src/app/models/package-meta';
 export class PackageDetailsVulnerabilitiesComponent {
   @Input()
   public vulnerabilities: Vulnerability[] | undefined;
+
+  @Input()
+  public deprecation: PackageDeprecation | undefined;
 }

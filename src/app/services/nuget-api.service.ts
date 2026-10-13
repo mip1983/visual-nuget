@@ -1,6 +1,6 @@
-import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { Injectable } from '@angular/core';
-import { catchError, forkJoin, map, Observable, of, switchMap } from 'rxjs';
+import { catchError, forkJoin, map, Observable, of, switchMap, throwError } from 'rxjs';
 import { prerelease } from 'semver';
 
 import { PackageSource } from '../../../src-common/models/package-source';
@@ -50,6 +50,10 @@ export class NuGetApiService {
   }
 
   public searchByPackageIds(packageIds: string[], query: string, prerelease: boolean, source: PackageSource): Observable<PackageRowModel[]> {
+    if (packageIds.length === 0) {
+      return of([]);
+    }
+
     const requestHeaders = this.composeRequestHeaders(source.authorizationHeader);
 
     return this.getApiUrl(source.url, requestHeaders, this.registrationsBaseUrlEndpoints).pipe(
@@ -92,9 +96,9 @@ export class NuGetApiService {
         })
         .pipe(
           //some packages will not exist on some sources, for these return null and filter after
-          catchError(() => of(null)),
+          catchError((error: HttpErrorResponse) => (error.status === 404 ? of(null) : throwError(() => error))),
           switchMap((packageMeta: PackageMetaResponse | null): Observable<RegistrationLeaf[] | null> => {
-            return this.getRegistrationLeafs(packageMeta);
+            return this.getRegistrationLeafs(packageMeta, authHeaders);
           }),
           map((registrationLeafs: RegistrationLeaf[] | null): CatalogEntry[] | null => {
             return this.getFilteredAndSortedCatalogEntries(registrationLeafs, includePrerelease);
@@ -113,7 +117,7 @@ export class NuGetApiService {
     );
   }
 
-  private getRegistrationLeafs(packageMeta: PackageMetaResponse | null): Observable<RegistrationLeaf[] | null> {
+  private getRegistrationLeafs(packageMeta: PackageMetaResponse | null, authHeaders: HttpHeaders): Observable<RegistrationLeaf[] | null> {
     if (packageMeta === null) {
       return of(null);
     }
@@ -127,10 +131,14 @@ export class NuGetApiService {
       } else {
         // need to fetch each page on an individual request to the API
         const registrationPageRequest = this.http
-          .get<RegistrationPage>(page['@id'])
+          .get<RegistrationPage>(page['@id'], { headers: authHeaders })
           .pipe(map((registrationPage: RegistrationPage): RegistrationLeaf[] => registrationPage?.items ?? []));
         allLeafsRequests.push(registrationPageRequest);
       }
+    }
+
+    if (allLeafsRequests.length === 0) {
+      return of([]);
     }
 
     // request all pages in parallel and then concatenate the results into one list
@@ -172,7 +180,7 @@ export class NuGetApiService {
   }
 
   private convertCatalogEntriesToPackageRow(catalogEntries: CatalogEntry[] | null, packageId: string, sourceUrl: string): PackageRowModel | null {
-    if (catalogEntries === null) {
+    if (catalogEntries === null || catalogEntries.length === 0) {
       return null;
     }
 
@@ -182,9 +190,9 @@ export class NuGetApiService {
     const packageRow: PackageRowModel = {
       id: packageId,
       version: latestCatalogEntry.version,
-      description: latestCatalogEntry.description,
+      description: latestCatalogEntry.description ?? '',
       authors: latestCatalogEntry.authors,
-      iconUrl: latestCatalogEntry.iconUrl,
+      iconUrl: latestCatalogEntry.iconUrl ?? '',
       totalDownloads: undefined,
       verified: false,
       isInstalled: false,
@@ -192,6 +200,8 @@ export class NuGetApiService {
       isOutdated: false,
       sourceUrl: sourceUrl,
       versions: catalogEntries,
+      vulnerabilities: latestCatalogEntry.vulnerabilities,
+      deprecation: latestCatalogEntry.deprecation,
     };
 
     return packageRow;
@@ -231,7 +241,7 @@ export class NuGetApiService {
 
     const trimmedLowerQuery = trimmedQuery.toLowerCase();
     const lowerId = result.id.toLowerCase();
-    const lowerDescription = result.description.toLowerCase();
+    const lowerDescription = result.description?.toLowerCase() ?? '';
 
     return lowerId.includes(trimmedLowerQuery) || lowerDescription.includes(trimmedLowerQuery);
   }
@@ -243,15 +253,14 @@ export class NuGetApiService {
       })
       .pipe(
         map((result: ApiIndexResponse): string => {
-          let endpointToUse = '';
           for (const ep of preferedEndpoints) {
             const foundEndpoint = result.resources.find((apiResource: ApiResource): boolean => apiResource['@type'].startsWith(ep));
             if (foundEndpoint) {
-              endpointToUse = foundEndpoint['@id'];
-              break;
+              return foundEndpoint['@id'];
             }
           }
-          return endpointToUse;
+          const resourceName = preferedEndpoints[0].startsWith(this.SEARCH_QUERY_SERVICE) ? 'search' : 'registration';
+          throw new Error(`The package source does not provide a supported ${resourceName} endpoint.`);
         })
       );
   }
@@ -264,6 +273,9 @@ export class NuGetApiService {
     const packagesWithInstalledInfo = packageSearchResults.map((packageSearchResult: PackageSearchResult) => {
       const packageRowModel: PackageRowModel = {
         ...packageSearchResult,
+        description: packageSearchResult.description ?? '',
+        iconUrl: packageSearchResult.iconUrl ?? '',
+        verified: packageSearchResult.verified ?? false,
         isInstalled: false,
         installedVersion: '',
         isOutdated: false,

@@ -35,6 +35,10 @@ When updating a CPM package in a solution, known project-level overrides and fra
 
 Solution support is an initial implementation: unsupported project types are skipped and reported, and projects that MSBuild cannot evaluate are shown as load failures. It does not yet provide full Visual Studio solution-level package-management parity.
 
+## Vulnerability and deprecation information
+
+When a package source provides vulnerability or deprecation metadata, Visual NuGet displays informational warnings in package results and details for the latest version. Warnings do not hide packages, change the selected version, or automatically update dependencies. Historical version-specific warning data depends on the source; an absent warning should not be treated as proof that a version is safe.
+
 ## Adding new package sources
 
 By default, Visual NuGet only uses nuget.org as a package source but you can add your own, including private ones.

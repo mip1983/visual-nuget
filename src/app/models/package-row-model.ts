@@ -16,6 +16,9 @@ export interface SolutionProjectPackageState {
 }
 
 export interface PackageRowModel extends PackageSearchResult {
+  description: string;
+  iconUrl: string;
+  verified: boolean;
   installedVersion: string;
   isInstalled: boolean;
   isOutdated: boolean;

@@ -1,7 +1,7 @@
 import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { UntypedFormControl } from '@angular/forms';
 import { PackageRowModel } from '../../models/package-row-model';
-import { CatalogEntry } from '../../models/package-meta';
+import { CatalogEntry, PackageDeprecation, Vulnerability } from '../../models/package-meta';
 import { PackageManagerService } from '../../services/package-manager.service';
 
 import { BaseComponent } from '../base-component';
@@ -18,6 +18,7 @@ export class PackageDetailsComponent extends BaseComponent implements OnInit {
   public isSolution = false;
   public selectedProjectPaths: string[] = [];
   public includeCpmExceptions = false;
+  public loadError: string | null = null;
 
   public selectedVersion: UntypedFormControl = new UntypedFormControl();
   private selectedPackageId: string | null = null;
@@ -26,8 +27,30 @@ export class PackageDetailsComponent extends BaseComponent implements OnInit {
     return this.selectedVersion.value as CatalogEntry;
   }
 
+  public get selectedVersionVulnerabilities(): Vulnerability[] | undefined {
+    const selectedVersion = this.selectedVersion.value as CatalogEntry | undefined;
+    if (selectedVersion?.vulnerabilities !== undefined) {
+      return selectedVersion.vulnerabilities;
+    }
+    if (this.package && selectedVersion?.version === this.package.version) {
+      return this.package.vulnerabilities;
+    }
+    return undefined;
+  }
+
+  public get selectedVersionDeprecation(): PackageDeprecation | undefined {
+    const selectedVersion = this.selectedVersion.value as CatalogEntry | undefined;
+    if (selectedVersion?.deprecation !== undefined) {
+      return selectedVersion.deprecation;
+    }
+    if (this.package && selectedVersion?.version === this.package.version) {
+      return this.package.deprecation;
+    }
+    return undefined;
+  }
+
   public get isLoading(): boolean {
-    return this.selectedPackageId !== null && this.package === null;
+    return this.selectedPackageId !== null && this.package === null && this.loadError === null;
   }
 
   public get isPackageOperationInProgress(): boolean {
@@ -43,6 +66,11 @@ export class PackageDetailsComponent extends BaseComponent implements OnInit {
     this.subscriptions.add(
       this.packageManager.currentSelectedPackageId.subscribe((selectedPackageId) => {
         this.selectedPackageId = selectedPackageId;
+      })
+    );
+    this.subscriptions.add(
+      this.packageManager.currentSelectedPackageError.subscribe((error) => {
+        this.loadError = error;
       })
     );
     this.subscriptions.add(

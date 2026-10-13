@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj": {}
+    "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj": {}
   },
   "projects": {
-    "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj": {
+    "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
+        "projectUniqueName": "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
         "projectName": "test",
-        "projectPath": "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
+        "projectPath": "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\CpmApp.csproj",
         "packagesPath": "D:\\MatthewPaul\\.nuget\\packages",
-        "outputPath": "D:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\obj\\",
+        "outputPath": "d:\\source\\visual-nuget\\visual-nuget\\src-ext\\test-fixtures\\cpm\\CpmApp\\obj\\",
         "projectStyle": "PackageReference",
         "crossTargeting": true,
         "centralPackageVersionsManagementEnabled": true,
@@ -68,7 +68,7 @@
             },
             "Azure.Identity": {
               "target": "Package",
-              "version": "[1.19.0, )",
+              "version": "[1.21.0, )",
               "versionCentrallyManaged": true
             },
             "Microsoft.Extensions.Http": {
@@ -94,7 +94,7 @@
           },
           "centralPackageVersions": {
             "Azure.Core": "1.61.0",
-            "Azure.Identity": "1.19.0",
+            "Azure.Identity": "1.21.0",
             "Microsoft.Extensions.Http": "10.0.12",
             "Newtonsoft.Json": "13.0.4",
             "Serilog": "4.4.0",
@@ -120,7 +120,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.1.26425.128/PortableRuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.2.26504.105/PortableRuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.AspNetCore": "(,10.0.32767]",
             "Microsoft.AspNetCore.Antiforgery": "(,10.0.32767]",
@@ -547,7 +547,7 @@
             },
             "Azure.Identity": {
               "target": "Package",
-              "version": "[1.19.0, )",
+              "version": "[1.21.0, )",
               "versionCentrallyManaged": true
             },
             "Microsoft.Extensions.Http": {
@@ -573,7 +573,7 @@
           },
           "centralPackageVersions": {
             "Azure.Core": "1.61.0",
-            "Azure.Identity": "1.19.0",
+            "Azure.Identity": "1.21.0",
             "Microsoft.Extensions.Http": "10.0.12",
             "Newtonsoft.Json": "13.0.4",
             "Serilog": "4.4.0",
@@ -594,19 +594,19 @@
           "downloadDependencies": [
             {
               "name": "Microsoft.AspNetCore.App.Ref",
-              "version": "[9.0.20, 9.0.20]"
+              "version": "[9.0.21, 9.0.21]"
             },
             {
               "name": "Microsoft.NETCore.App.Host.win-x64",
-              "version": "[9.0.20, 9.0.20]"
+              "version": "[9.0.21, 9.0.21]"
             },
             {
               "name": "Microsoft.NETCore.App.Ref",
-              "version": "[9.0.20, 9.0.20]"
+              "version": "[9.0.21, 9.0.21]"
             },
             {
               "name": "Microsoft.WindowsDesktop.App.Ref",
-              "version": "[9.0.20, 9.0.20]"
+              "version": "[9.0.21, 9.0.21]"
             }
           ],
           "frameworkReferences": {
@@ -617,7 +617,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.1.26425.128/PortableRuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.2.26504.105/PortableRuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.AspNetCore": "(,9.0.32767]",
             "Microsoft.AspNetCore.Antiforgery": "(,9.0.32767]",

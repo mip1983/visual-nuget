@@ -128,6 +128,7 @@
     "lint": "ng lint",
     "test": "jest",
     "test-coverage": "jest --coverage",
+    "test:extension": "vscode-test",
     "test:watch": "jest --watch"
   },
   "private": true,
@@ -167,6 +168,8 @@
     "@types/xml2js": "^0.4.14",
     "@typescript-eslint/eslint-plugin": "^8.1.0",
     "@typescript-eslint/parser": "^8.1.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.0.0",
     "angular-eslint": "^22.6.0",
     "eslint": "^10.12.0",
@@ -182,6 +185,10 @@
   },
   "jest": {
     "preset": "jest-preset-angular",
+    "testPathIgnorePatterns": [
+      "<rootDir>/src-ext/test/",
+      "/node_modules/"
+    ],
     "setupFilesAfterEnv": [
       "<rootDir>/setup-jest.ts"
     ],

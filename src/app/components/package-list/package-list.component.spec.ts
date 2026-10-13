@@ -1,20 +1,26 @@
+import { CommonModule } from '@angular/common';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { BehaviorSubject } from 'rxjs';
 
 import { Category } from '../../models/category';
 import { PackageRowModel, SolutionProjectPackageState } from '../../models/package-row-model';
 import { PackageLevel, Solution } from '../../../../src-common/models/project';
+import { ShortNumberPipe } from '../../pipes/short-number.pipe';
 import { PackageManagerService } from '../../services/package-manager.service';
 import { PackageListComponent } from './package-list.component';
 
 describe('PackageListComponent', () => {
   let fixture: ComponentFixture<PackageListComponent>;
   let category: BehaviorSubject<Category>;
+  let packageError: BehaviorSubject<string | null>;
 
   beforeEach(async () => {
     category = new BehaviorSubject<Category>(Category.Browse);
+    packageError = new BehaviorSubject<string | null>(null);
     const packageManagerMock = {
-      currentPackages: new BehaviorSubject<PackageRowModel[] | null>([]),
+      currentPackages: new BehaviorSubject<PackageRowModel[] | null>(null),
+      currentPackagesError: packageError,
       currentSelectedPackageId: new BehaviorSubject<string | null>(null),
       currentCategory: category,
       currentSolution: new BehaviorSubject<Solution | null>(null),
@@ -22,10 +28,11 @@ describe('PackageListComponent', () => {
     };
 
     await TestBed.configureTestingModule({
-      declarations: [PackageListComponent],
+      declarations: [PackageListComponent, ShortNumberPipe],
+      imports: [CommonModule],
+      schemas: [NO_ERRORS_SCHEMA],
       providers: [{ provide: PackageManagerService, useValue: packageManagerMock }],
     })
-      .overrideComponent(PackageListComponent, { set: { template: '' } })
       .compileComponents();
 
     fixture = TestBed.createComponent(PackageListComponent);
@@ -69,6 +76,15 @@ describe('PackageListComponent', () => {
     category.next(Category.Updates);
 
     expect(fixture.componentInstance.showSelectCheckboxes).toBe(true);
+  });
+
+  test('renders package source errors instead of a permanent loading spinner', () => {
+    const error = 'Packages could not be loaded from the selected source. Check the source settings or connection, then refresh.';
+    packageError.next(error);
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('[role="alert"]')?.textContent.trim()).toBe(error);
+    expect(fixture.nativeElement.querySelector('app-loading-spinner')).toBeNull();
   });
 });
 

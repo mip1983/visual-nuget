@@ -1,5 +1,5 @@
 import { TestBed } from '@angular/core/testing';
-import { of, skip, take, zip } from 'rxjs';
+import { of, skip, take, throwError, zip } from 'rxjs';
 import { Category } from '../models/category';
 import { PackageRowModel } from '../models/package-row-model';
 import { PackageOperationResult } from '../../../src-common/models/extension-message';
@@ -379,6 +379,7 @@ describe('PackageManagerService', () => {
     service.currentSelectedPackage.subscribe((packageRow) => {
       selectedPackage = packageRow;
     });
+
     service.currentSelectedPackageId.subscribe((packageId) => {
       selectedPackageId = packageId;
     });
@@ -387,6 +388,83 @@ describe('PackageManagerService', () => {
 
     expect(selectedPackage).toBe(refreshedPackages[0]);
     expect(selectedPackageId).toBe(refreshedPackages[0].id);
+  });
+
+  test('queryForPackages_onBrowseFailurePublishesSafeErrorAndRetryClearsIt', () => {
+    const source = { ...getMockPackageSource(), authorizationHeader: 'Bearer test-token' };
+    let packages: PackageRowModel[] | null = [];
+    let errorMessage: string | null = null;
+    service.currentPackages.subscribe((value) => (packages = value));
+    service.currentPackagesError.subscribe((value) => (errorMessage = value));
+    nugetApiServiceMock.search.mockReturnValue(throwError(() => new Error(`Request failed for ${source.url} ${source.authorizationHeader}`)));
+
+    service.queryForPackages('widget', false, source);
+
+    expect(packages).toBeNull();
+    expect(errorMessage).toBe('Packages could not be loaded from the selected source. Check the source settings or connection, then refresh.');
+    expect(errorMessage).not.toContain(source.authorizationHeader);
+
+    const expectedPackages = getMockApiPackages();
+    nugetApiServiceMock.search.mockReturnValue(of(expectedPackages));
+    service.queryForPackages('widget', false, source);
+
+    expect(packages).toBe(expectedPackages);
+    expect(errorMessage).toBeNull();
+  });
+
+  test('queryForPackages_onInstalledFeedFailurePublishesVisibleError', () => {
+    const source = getMockPackageSource();
+    const project = getMockCurrentProject();
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Installed);
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(throwError(() => new Error('Private feed unavailable')));
+    let errorMessage: string | null = null;
+    service.currentPackagesError.subscribe((value) => (errorMessage = value));
+
+    service.queryForPackages('', false, source);
+
+    expect(errorMessage).toBe('Packages could not be loaded from the selected source. Check the source settings or connection, then refresh.');
+  });
+
+  test('changeCurrentSelectedPackage_onMetadataFailureShowsErrorAndCanRecover', () => {
+    const source = { ...getMockPackageSource(), authorizationHeader: 'Bearer test-token' };
+    nugetApiServiceMock.search.mockReturnValue(of(getMockApiPackages()));
+    service.queryForPackages('', false, source);
+    const selectedPackage = { ...getMockApiPackages()[0], versions: undefined };
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(throwError(() => new Error(`Request failed ${source.authorizationHeader}`)));
+    let selectedPackageError: string | null = null;
+    let currentPackage: PackageRowModel | null = null;
+    service.currentSelectedPackageError.subscribe((value) => (selectedPackageError = value));
+    service.currentSelectedPackage.subscribe((value) => (currentPackage = value));
+
+    service.changeCurrentSelectedPackage(selectedPackage);
+
+    expect(currentPackage).toBeNull();
+    expect(selectedPackageError).toBe(
+      'Package details could not be loaded from the selected source. Check the source settings or connection and retry.'
+    );
+    expect(selectedPackageError).not.toContain(source.authorizationHeader);
+
+    const withVersions = { ...selectedPackage, versions: [] };
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of([withVersions]));
+    service.changeCurrentSelectedPackage(selectedPackage);
+
+    expect(currentPackage).toBe(selectedPackage);
+    expect(selectedPackage.versions).toEqual([]);
+    expect(selectedPackageError).toBeNull();
+  });
+
+  test('changeCurrentSelectedPackage_whenSourceDoesNotReturnPackageShowsError', () => {
+    const source = getMockPackageSource();
+    nugetApiServiceMock.search.mockReturnValue(of([]));
+    service.queryForPackages('', false, source);
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of([]));
+    let errorMessage: string | null = null;
+    service.currentSelectedPackageError.subscribe((value) => (errorMessage = value));
+
+    service.changeCurrentSelectedPackage({ ...getMockApiPackages()[0], versions: undefined });
+
+    expect(errorMessage).toBe('Package details were not returned by the selected source. Check the source settings and retry.');
   });
 
   test('queryForPackages clears the selected package when it is no longer in the results', () => {
@@ -401,17 +479,22 @@ describe('PackageManagerService', () => {
 
     let selectedPackage: PackageRowModel | null = initialPackages[0];
     let selectedPackageId: string | null = initialPackages[0].id;
+    let packages: PackageRowModel[] | null = initialPackages;
     service.currentSelectedPackage.subscribe((packageRow) => {
       selectedPackage = packageRow;
     });
     service.currentSelectedPackageId.subscribe((packageId) => {
       selectedPackageId = packageId;
     });
+    service.currentPackages.subscribe((packageRows) => {
+      packages = packageRows;
+    });
 
     service.queryForPackages('', false, source);
 
     expect(selectedPackage).toBeNull();
     expect(selectedPackageId).toBeNull();
+    expect(packages).toEqual([]);
   });
 
   test('queryForPackages should set current packages with installed info on browse', (done) => {

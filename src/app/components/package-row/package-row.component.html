@@ -32,6 +32,24 @@
             ><fa-icon icon="circle-check"></fa-icon
           ></span>
         }
+        @if (package.vulnerabilities?.length) {
+          <span
+            class="package-warning-icon vulnerability-warning"
+            role="img"
+            [attr.aria-label]="'Known vulnerabilities in version ' + package.version"
+            [title]="'Known vulnerabilities in version ' + package.version"
+            ><fa-icon icon="triangle-exclamation" aria-hidden="true"></fa-icon
+          ></span>
+        }
+        @if (package.deprecation) {
+          <span
+            class="package-warning-icon deprecation-warning"
+            role="img"
+            [attr.aria-label]="'Version ' + package.version + ' is deprecated'"
+            [title]="'Version ' + package.version + ' is deprecated'"
+            ><fa-icon icon="triangle-exclamation" aria-hidden="true"></fa-icon
+          ></span>
+        }
         @if (package.authors) {
           <span class="author">by {{ package.authors }}</span>
         }
