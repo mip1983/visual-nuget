@@ -1,17 +1,66 @@
-import { provideHttpClient } from '@angular/common/http';
+import { HttpClient, provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
+import { Injectable } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
-import { firstValueFrom } from 'rxjs';
+import { firstValueFrom, of, delay } from 'rxjs';
+import { performance } from 'node:perf_hooks';
 
 import { PackageSource } from '../../../src-common/models/package-source';
+import { SessionCacheKind } from '../../../src-common/models/ui-message';
 import { ApiIndexResponse } from '../models/api-index-response';
 import { CatalogEntry, PackageMetaResponse, RegistrationLeaf, RegistrationPage } from '../models/package-meta';
 import { SearchResults } from '../models/search-results';
+import SessionPackageCache from '../../../src-ext/services/session-package-cache';
 import { NuGetApiService } from './nuget-api.service';
+import { VscodeService } from './vscode.service';
+import { VersionService } from './version.service';
+
+@Injectable()
+class TestSessionCacheBridge extends VscodeService {
+  private readonly cache = new SessionPackageCache();
+  public responseDelayMilliseconds = 0;
+
+  public override getSessionCache(
+    cacheKind: SessionCacheKind,
+    sourceUrl: string,
+    authorizationHeader: string | undefined,
+    keyParts: Array<string | boolean | number>
+  ) {
+    const cacheKey = this.cache.createKey(cacheKind, sourceUrl, authorizationHeader, keyParts);
+    const value = this.cache.get(cacheKey) ?? null;
+    return this.responseDelayMilliseconds === 0 ? of(value) : of(value).pipe(delay(this.responseDelayMilliseconds));
+  }
+
+  public override setSessionCache(
+    cacheKind: SessionCacheKind,
+    sourceUrl: string,
+    authorizationHeader: string | undefined,
+    keyParts: Array<string | boolean | number>,
+    entryKind: 'package-data' | 'service-index',
+    value: string
+  ): void {
+    const cacheKey = this.cache.createKey(cacheKind, sourceUrl, authorizationHeader, keyParts);
+    this.cache.set(cacheKey, sourceUrl, entryKind, value);
+  }
+
+  public override deleteSessionCache(
+    cacheKind: SessionCacheKind,
+    sourceUrl: string,
+    authorizationHeader: string | undefined,
+    keyParts: Array<string | boolean | number>
+  ): void {
+    this.cache.delete(this.cache.createKey(cacheKind, sourceUrl, authorizationHeader, keyParts));
+  }
+
+  public override clearSessionPackageCache(sourceUrl: string): void {
+    this.cache.clearPackageData(sourceUrl);
+  }
+}
 
 describe('NuGetApiService', () => {
   let service: NuGetApiService;
   let http: HttpTestingController;
+  let sessionCacheBridge: VscodeService;
   const source: PackageSource = {
     name: 'Private feed',
     url: 'https://packages.example.test/v3/index.json',
@@ -20,10 +69,16 @@ describe('NuGetApiService', () => {
 
   beforeEach(() => {
     TestBed.configureTestingModule({
-      providers: [NuGetApiService, provideHttpClient(), provideHttpClientTesting()],
+      providers: [
+        NuGetApiService,
+        { provide: VscodeService, useClass: TestSessionCacheBridge },
+        provideHttpClient(),
+        provideHttpClientTesting(),
+      ],
     });
     service = TestBed.inject(NuGetApiService);
     http = TestBed.inject(HttpTestingController);
+    sessionCacheBridge = TestBed.inject(VscodeService);
   });
 
   afterEach(() => http.verify());
@@ -129,12 +184,99 @@ describe('NuGetApiService', () => {
     await expect(refreshedRequest).resolves.toEqual([expect.objectContaining({ version: '3.0.0' })]);
   });
 
-  test('search_serviceIndexFailurePropagatesWithoutCallingSearchEndpoint', async () => {
+  test('search_reusesSessionCachedResultsAcrossApiServiceInstances', async () => {
+    const firstRequest = firstValueFrom(service.search('widget', false, source));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'Cached result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(firstRequest).resolves.toEqual([expect.objectContaining({ version: '2.1.0' })]);
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    await expect(firstValueFrom(reopenedService.search('widget', false, source))).resolves.toEqual([
+      expect.objectContaining({ version: '2.1.0', description: 'Cached result' }),
+    ]);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+  });
+
+  test('search_sessionCacheSeparatesQueryAndPrereleaseIdentity', async () => {
+    const firstRequest = firstValueFrom(service.search('widget', false, source));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'Stable result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await firstRequest;
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const differentQuery = firstValueFrom(reopenedService.search('gadget', false, source));
+    const queryRequest = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(queryRequest.request.params.get('q')).toBe('gadget');
+    expect(queryRequest.request.params.get('prerelease')).toBe('false');
+    queryRequest.flush({ totalHits: 0, data: [] } satisfies SearchResults);
+    await expect(differentQuery).resolves.toEqual([]);
+
+    const prereleaseQuery = firstValueFrom(reopenedService.search('widget', true, source));
+    const prereleaseRequest = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(prereleaseRequest.request.params.get('q')).toBe('widget');
+    expect(prereleaseRequest.request.params.get('prerelease')).toBe('true');
+    prereleaseRequest.flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '3.0.0-beta.1', description: 'Preview result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(prereleaseQuery).resolves.toEqual([expect.objectContaining({ version: '3.0.0-beta.1' })]);
+
+    await expect(firstValueFrom(reopenedService.search('widget', false, source))).resolves.toEqual([
+      expect.objectContaining({ version: '2.1.0', description: 'Stable result' }),
+    ]);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+  });
+
+  test('search_doesNotCacheServiceIndexFailuresAcrossApiServiceInstances', async () => {
     const result = firstValueFrom(service.search('widget', false, source));
     http.expectOne(source.url).flush({ message: 'Feed unavailable' }, { status: 503, statusText: 'Service Unavailable' });
 
     await expect(result).rejects.toMatchObject({ status: 503 });
     http.expectNone('https://packages.example.test/v3/search/');
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const retry = firstValueFrom(reopenedService.search('widget', false, source));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 0,
+      data: [],
+    } satisfies SearchResults);
+    await expect(retry).resolves.toEqual([]);
+  });
+
+  test('search_doesNotCacheFailedSearchResponsesAcrossApiServiceInstances', async () => {
+    const result = firstValueFrom(service.search('widget', false, source));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush(
+      { message: 'Search unavailable' },
+      { status: 503, statusText: 'Service Unavailable' }
+    );
+    await expect(result).rejects.toMatchObject({ status: 503 });
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const retry = firstValueFrom(reopenedService.search('widget', false, source));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 0,
+      data: [],
+    } satisfies SearchResults);
+    await expect(retry).resolves.toEqual([]);
+    http.expectNone(source.url);
   });
 
   test('search_withoutSupportedEndpoint_rejectsInsteadOfRequestingAnEmptyUrl', async () => {
@@ -190,6 +332,33 @@ describe('NuGetApiService', () => {
     });
   });
 
+  test('searchByPackageIds_reusesPackageHistoryAcrossApiServiceInstances', async () => {
+    const firstRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', true, source));
+    http.expectOne(source.url).flush(registrationIndex());
+    http
+      .expectOne('https://packages.example.test/v3/registration/widget.package/index.json')
+      .flush(registration([catalogEntry('2.1.0-beta.1')]));
+
+    await expect(firstRequest).resolves.toEqual([
+      expect.objectContaining({
+        id: 'Widget.Package',
+        version: '2.1.0-beta.1',
+        versions: [expect.objectContaining({ version: '2.1.0-beta.1' })],
+      }),
+    ]);
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    await expect(firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', true, source))).resolves.toEqual([
+      expect.objectContaining({
+        id: 'Widget.Package',
+        version: '2.1.0-beta.1',
+        versions: [expect.objectContaining({ version: '2.1.0-beta.1' })],
+      }),
+    ]);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/registration/widget.package/index.json');
+  });
+
   test('searchByPackageIds_canLoadPackageSummariesWithIconsWithoutRegistrationHistories', async () => {
     const result = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
     http.expectOne(source.url).flush(
@@ -228,6 +397,119 @@ describe('NuGetApiService', () => {
     http.expectNone('https://packages.example.test/v3/registration/widget.package/index.json');
   });
 
+  test('searchByPackageIds_sessionCacheSeparatesSummaryPackageIdAndPrereleaseIdentity', async () => {
+    const firstRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    const stableWidgetRequest = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(stableWidgetRequest.request.params.get('q')).toBe('packageid:Widget.Package');
+    expect(stableWidgetRequest.request.params.get('prerelease')).toBe('false');
+    stableWidgetRequest.flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'Stable widget', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(firstRequest).resolves.toEqual([expect.objectContaining({ version: '2.1.0' })]);
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const otherPackageRequest = firstValueFrom(
+      reopenedService.searchByPackageIds(['Other.Package'], '', false, source, false)
+    );
+    const otherPackageSearch = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(otherPackageSearch.request.params.get('q')).toBe('packageid:Other.Package');
+    otherPackageSearch.flush({
+      totalHits: 1,
+      data: [{ id: 'Other.Package', version: '1.4.0', description: 'Other package', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(otherPackageRequest).resolves.toEqual([expect.objectContaining({ version: '1.4.0' })]);
+
+    const prereleaseRequest = firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', true, source, false));
+    const prereleaseSearch = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(prereleaseSearch.request.params.get('q')).toBe('packageid:Widget.Package');
+    expect(prereleaseSearch.request.params.get('prerelease')).toBe('true');
+    prereleaseSearch.flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '3.0.0-beta.1', description: 'Preview widget', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(prereleaseRequest).resolves.toEqual([expect.objectContaining({ version: '3.0.0-beta.1' })]);
+
+    await expect(firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', false, source, false))).resolves.toEqual([
+      expect.objectContaining({ version: '2.1.0', description: 'Stable widget' }),
+    ]);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+  });
+
+  test('searchByPackageIds_reusesLargeInventorySnapshotAcrossApiServiceInstances', async () => {
+    const packageIds = Array.from({ length: 520 }, (_, index) => `Widget.Package.${index.toString().padStart(4, '0')}`);
+    const firstRequest = firstValueFrom(service.searchByPackageIds(packageIds, '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+
+    let flushedRequests = 0;
+    while (flushedRequests < packageIds.length) {
+      const requests = http.match((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+      expect(requests.length).toBeGreaterThan(0);
+      requests.forEach((request) => {
+        const query = request.request.params.get('q');
+        if (!query?.startsWith('packageid:')) {
+          throw new Error('Expected a package summary query.');
+        }
+        const packageId = query.slice('packageid:'.length);
+        request.flush({
+          totalHits: 1,
+          data: [{ id: packageId, version: '1.0.0', description: packageId, totalDownloads: undefined }],
+        } satisfies SearchResults);
+      });
+      flushedRequests += requests.length;
+    }
+
+    const firstResults = await firstRequest;
+    expect(firstResults.map((packageRow) => packageRow.id).sort()).toEqual([...packageIds].sort());
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const reopenedResults = await firstValueFrom(reopenedService.searchByPackageIds(packageIds, '', false, source, false));
+    expect(reopenedResults.map((packageRow) => packageRow.id).sort()).toEqual([...packageIds].sort());
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+  });
+
+  test('reports cold and reopened metadata timings while skipping feed requests on cache hit', async () => {
+    const packageIds = ['Widget.Package'];
+    const simulatedFeedDelayMs = 50;
+    const coldStart = performance.now();
+    const coldRequest = firstValueFrom(service.searchByPackageIds(packageIds, '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    await new Promise((resolve) => setTimeout(resolve, simulatedFeedDelayMs));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'A widget package', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    const coldResults = await coldRequest;
+    const coldElapsedMs = performance.now() - coldStart;
+
+    const testCacheBridge = sessionCacheBridge as TestSessionCacheBridge;
+    testCacheBridge.responseDelayMilliseconds = 5;
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), testCacheBridge);
+    const reopenedStart = performance.now();
+    const reopenedResults = await firstValueFrom(reopenedService.searchByPackageIds(packageIds, '', false, source, false));
+    const reopenedElapsedMs = performance.now() - reopenedStart;
+
+    expect(coldResults).toEqual([expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' })]);
+    expect(reopenedResults).toEqual(coldResults);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+    expect(Number.isFinite(coldElapsedMs)).toBe(true);
+    expect(Number.isFinite(reopenedElapsedMs)).toBe(true);
+    console.info(
+      `[Visual NuGet timing] package metadata: initial=${coldElapsedMs.toFixed(1)}ms ` +
+        `(includes ${simulatedFeedDelayMs}ms simulated feed delay), reopen=${reopenedElapsedMs.toFixed(1)}ms ` +
+        '(simulated 5ms host-cache bridge delay; no feed requests)'
+    );
+  });
+
   test('searchByPackageIds_reusesPackageSummariesAndTheFeedServiceIndex', async () => {
     const summaryRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
     http.expectOne(source.url).flush(
@@ -248,7 +530,8 @@ describe('NuGetApiService', () => {
 
     await expect(summaryRequest).resolves.toEqual([expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' })]);
 
-    await expect(firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false))).resolves.toEqual([
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    await expect(firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', false, source, false))).resolves.toEqual([
       expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' }),
     ]);
     http.expectNone(source.url);
@@ -266,7 +549,8 @@ describe('NuGetApiService', () => {
 
     service.clearPackageCache(source);
 
-    const refreshedRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const refreshedRequest = firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', false, source, false));
     http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
       totalHits: 1,
       data: [{ id: 'Widget.Package', version: '3.0.0', description: 'Refreshed result', totalDownloads: undefined }],
@@ -295,9 +579,13 @@ describe('NuGetApiService', () => {
     await firstRequest;
 
     const otherSource = { ...source, authorizationHeader: 'Bearer another-user' };
-    const secondRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, otherSource, false));
+    const otherSourceForRequest = { ...otherSource, authorizationHeader: 'Bearer different-test-credential' };
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const secondRequest = firstValueFrom(
+      reopenedService.searchByPackageIds(['Widget.Package'], '', false, otherSourceForRequest, false)
+    );
     const secondIndex = http.expectOne(source.url);
-    expect(secondIndex.request.headers.get('authorization')).toBe(otherSource.authorizationHeader);
+    expect(secondIndex.request.headers.get('authorization')).toBe(otherSourceForRequest.authorizationHeader);
     secondIndex.flush(apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']]));
     http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
       totalHits: 1,
@@ -326,7 +614,8 @@ describe('NuGetApiService', () => {
     );
     await expect(failedRequest).rejects.toMatchObject({ status: 503 });
 
-    const retryRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const retryRequest = firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', false, source, false));
     http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
       totalHits: 1,
       data: [
@@ -422,7 +711,7 @@ describe('NuGetApiService', () => {
     ]);
   });
 
-  test('searchByPackageIds_pagedRegistrationFailurePropagates', async () => {
+  test('searchByPackageIds_doesNotCacheFailedHistoryAcrossApiServiceInstances', async () => {
     const result = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source));
     http.expectOne(source.url).flush(registrationIndex());
     http
@@ -437,6 +726,16 @@ describe('NuGetApiService', () => {
     );
 
     await expect(result).rejects.toMatchObject({ status: 502 });
+
+    const reopenedService = new NuGetApiService(TestBed.inject(HttpClient), TestBed.inject(VersionService), sessionCacheBridge);
+    const retry = firstValueFrom(reopenedService.searchByPackageIds(['Widget.Package'], '', false, source));
+    http
+      .expectOne('https://packages.example.test/v3/registration/widget.package/index.json')
+      .flush(registration([catalogEntry('2.1.0')]));
+    await expect(retry).resolves.toEqual([
+      expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' }),
+    ]);
+    http.expectNone(source.url);
   });
 
   test('searchByPackageIds_emptyPagedRegistrationPageReturnsNoPackages', async () => {

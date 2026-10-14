@@ -537,12 +537,16 @@ export default class ProjectFileLoader {
     return loadInventoryProject(fullPath, entries);
   }
 
-  public async loadSolutionInventoryAsync(solutionFilePath: string, projectFilePaths: string[]): Promise<Project[]> {
+  public async loadSolutionInventoryAsync(
+    solutionFilePath: string,
+    projectFilePaths: string[] | Promise<string[]>
+  ): Promise<Project[]> {
     const fullPath = path.resolve(solutionFilePath);
-    const output = await this.listSolutionPackages(fullPath);
+    const packageListPromise = this.listSolutionPackages(fullPath);
+    const [output, resolvedProjectFilePaths] = await Promise.all([packageListPromise, Promise.resolve(projectFilePaths)]);
     const document = parsePackageListDocument(output);
     const projectPaths = new Set(document.projects.map((project) => normalizeProjectPath(project.path)));
-    const missingProjects = projectFilePaths.filter((projectPath) => !projectPaths.has(normalizeProjectPath(projectPath)));
+    const missingProjects = resolvedProjectFilePaths.filter((projectPath) => !projectPaths.has(normalizeProjectPath(projectPath)));
     if (missingProjects.length > 0) {
       throw new Error(`dotnet package list did not return ${missingProjects.length} solution project(s): ${missingProjects.join(', ')}`);
     }
@@ -555,7 +559,7 @@ export default class ProjectFileLoader {
       entriesByProject.set(key, projectEntries);
     });
     return Promise.all(
-      projectFilePaths.map((projectPath) =>
+      resolvedProjectFilePaths.map((projectPath) =>
         loadInventoryProject(projectPath, entriesByProject.get(normalizeProjectPath(projectPath)) ?? [])
       )
     );

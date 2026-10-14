@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import WebviewMessageHandler from './services/webview-message-handler';
+import SessionPackageCache from './services/session-package-cache';
+import SessionSolutionCache from './services/session-solution-cache';
 
 export default class UiPanel {
   public static currentPanels: Record<string, UiPanel | undefined> = {};
@@ -16,7 +18,14 @@ export default class UiPanel {
   private readonly webviewMessageHandler: WebviewMessageHandler;
   private disposables: vscode.Disposable[] = [];
 
-  public static createOrShow(extensionPath: string, resourceUri: vscode.Uri, type: 'project' | 'solution' = 'project') {
+  public static createOrShow(
+    extensionPath: string,
+    resourceUri: vscode.Uri,
+    sessionPackageCache: SessionPackageCache,
+    sessionSolutionCache: SessionSolutionCache,
+    type: 'project' | 'solution' = 'project',
+    diagnosticOutput?: vscode.OutputChannel
+  ) {
     const column = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : undefined;
 
     const filePath = resourceUri.fsPath;
@@ -27,11 +36,14 @@ export default class UiPanel {
     if (existingPanel) {
       existingPanel.panel.reveal(column);
     } else {
-      UiPanel.currentPanels[panelKey] = new UiPanel(extensionPath, column || vscode.ViewColumn.One, {
-        type,
-        filePath,
-        panelKey,
-      });
+      UiPanel.currentPanels[panelKey] = new UiPanel(
+        extensionPath,
+        column || vscode.ViewColumn.One,
+        { type, filePath, panelKey },
+        sessionPackageCache,
+        sessionSolutionCache,
+        diagnosticOutput
+      );
     }
     return UiPanel.currentPanels;
   }
@@ -39,7 +51,10 @@ export default class UiPanel {
   private constructor(
     extensionPath: string,
     column: vscode.ViewColumn,
-    context: { type: 'project' | 'solution'; filePath: string; panelKey: string }
+    context: { type: 'project' | 'solution'; filePath: string; panelKey: string },
+    sessionPackageCache: SessionPackageCache,
+    sessionSolutionCache: SessionSolutionCache,
+    diagnosticOutput?: vscode.OutputChannel
   ) {
     this.extensionPath = extensionPath;
     this.builtAppFolder = 'dist';
@@ -59,10 +74,13 @@ export default class UiPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
     // initialize the message handler for the communication between the webview and the extension
-    this.webviewMessageHandler = new WebviewMessageHandler(this.panel.webview, {
-      type: this.context.type,
-      filePath: this.context.filePath,
-    });
+    this.webviewMessageHandler = new WebviewMessageHandler(
+      this.panel.webview,
+      { type: this.context.type, filePath: this.context.filePath },
+      sessionPackageCache,
+      sessionSolutionCache,
+      (message) => diagnosticOutput?.appendLine(`[cache] ${message}`)
+    );
   }
 
   private dispose() {

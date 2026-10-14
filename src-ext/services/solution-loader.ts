@@ -52,19 +52,28 @@ export default class SolutionLoader {
     onProgress?: (progress: SolutionLoadProgress) => void
   ): Promise<Solution> {
     const fullPath = path.resolve(solutionFilePath);
-    const listedPaths = parseProjectPaths(await this.listProjects(fullPath));
-    const unsupportedProjects: string[] = [];
-    const loadFailures: ProjectLoadFailure[] = [];
-    const supportedPaths: string[] = [];
-
-    for (const listedPath of listedPaths) {
-      const projectPath = path.resolve(path.dirname(fullPath), listedPath);
-      if (!supportedProjectExtensions.has(path.extname(projectPath).toLowerCase())) {
-        unsupportedProjects.push(projectPath);
-        continue;
+    const listedProjectsPromise = this.listProjects(fullPath).then((output) => {
+      const unsupportedProjects: string[] = [];
+      const supportedPaths: string[] = [];
+      for (const listedPath of parseProjectPaths(output)) {
+        const projectPath = path.resolve(path.dirname(fullPath), listedPath);
+        if (!supportedProjectExtensions.has(path.extname(projectPath).toLowerCase())) {
+          unsupportedProjects.push(projectPath);
+          continue;
+        }
+        supportedPaths.push(projectPath);
       }
-      supportedPaths.push(projectPath);
-    }
+      return { supportedPaths, unsupportedProjects };
+    });
+    const inventoryPromise = this.projectLoader.loadSolutionInventoryAsync?.(
+      fullPath,
+      listedProjectsPromise.then(({ supportedPaths }) => supportedPaths)
+    ).then(
+      (projects) => ({ projects }),
+      (error: unknown) => ({ error })
+    );
+    const { supportedPaths, unsupportedProjects } = await listedProjectsPromise;
+    const loadFailures: ProjectLoadFailure[] = [];
 
     if (supportedPaths.length === 0) {
       return {
@@ -83,12 +92,18 @@ export default class SolutionLoader {
         message: `Loading package inventory for ${supportedPaths.length} solution projects...`,
       });
       try {
-        const projects = await this.projectLoader.loadSolutionInventoryAsync(fullPath, supportedPaths);
+        if (!inventoryPromise) {
+          throw new Error('Solution inventory loading is unavailable.');
+        }
+        const inventoryResult = await inventoryPromise;
+        if ('error' in inventoryResult) {
+          throw inventoryResult.error;
+        }
         onProgress?.({ completed: supportedPaths.length, total: supportedPaths.length });
         return {
           name: path.basename(fullPath, path.extname(fullPath)),
           fsPath: fullPath,
-          projects,
+          projects: inventoryResult.projects,
           unsupportedProjects,
           loadFailures: [],
         };

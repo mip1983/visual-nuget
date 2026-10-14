@@ -1,7 +1,9 @@
 import * as path from 'path';
+import { performance } from 'node:perf_hooks';
 import { Project } from '../../src-common/models/project';
 import ProjectFileLoader from './project-file-loader';
 import SolutionLoader, { SolutionProjectLister } from './solution-loader';
+import { executeDotnet } from './dotnet-cli';
 
 describe('SolutionLoader', () => {
   it('loads supported projects from an SLNX list and reports unsupported projects', async () => {
@@ -33,19 +35,29 @@ describe('SolutionLoader', () => {
     const solutionPath = path.resolve('workspace', 'Sample.slnx');
     const projectPath = path.resolve('workspace', 'src', 'App.csproj');
     const project: Project = { name: 'App.csproj', fsPath: projectPath, packages: [] };
+    let resolveProjectList!: (projectList: string) => void;
     const projectLoader: ProjectLoaderForTest = {
       loadProjectAsync: jest.fn(),
       loadSolutionInventoryAsync: jest.fn().mockResolvedValue([project]),
     };
-    const loader = new SolutionLoader(
-      projectLoader,
-      async () => ['Project(s)', '----------', 'src\\App.csproj'].join('\n')
+    const listProjects = jest.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveProjectList = resolve;
+        })
     );
+    const loader = new SolutionLoader(projectLoader, listProjects);
     const progress: Array<{ completed: number; total: number; message?: string }> = [];
 
-    const solution = await loader.loadSolutionAsync(solutionPath, (state) => progress.push(state));
+    const loading = loader.loadSolutionAsync(solutionPath, (state) => progress.push(state));
 
-    expect(projectLoader.loadSolutionInventoryAsync).toHaveBeenCalledWith(solutionPath, [projectPath]);
+    expect(projectLoader.loadSolutionInventoryAsync).toHaveBeenCalledTimes(1);
+    const inventoryProjectPaths = (projectLoader.loadSolutionInventoryAsync as jest.Mock).mock.calls[0][1] as Promise<string[]>;
+    resolveProjectList(['Project(s)', '----------', 'src\\App.csproj'].join('\n'));
+    const solution = await loading;
+
+    await expect(inventoryProjectPaths).resolves.toEqual([projectPath]);
+    expect(listProjects).toHaveBeenCalledWith(solutionPath);
     expect(projectLoader.loadProjectAsync).not.toHaveBeenCalled();
     expect(solution.projects).toEqual([project]);
     expect(progress[0].message).toContain('Loading package inventory');
@@ -122,12 +134,50 @@ describe('SolutionLoader', () => {
 
   it('uses the dotnet SLNX project list for the CPM fixture', async () => {
     const solutionPath = path.resolve(__dirname, '..', 'test-fixtures', 'cpm', 'CpmFixture.slnx');
-    const solution = await new SolutionLoader().loadSolutionAsync(solutionPath);
+    const actualProjectLoader = new ProjectFileLoader();
+    const timings = { projectEnumerationMs: [] as number[], packageInventoryMs: [] as number[], totalMs: [] as number[] };
+    const timedProjectLoader = {
+      loadProjectAsync: actualProjectLoader.loadProjectAsync.bind(actualProjectLoader),
+      loadSolutionInventoryAsync: async (filePath: string, projectPaths: string[]) => {
+        const startedAt = performance.now();
+        try {
+          return await actualProjectLoader.loadSolutionInventoryAsync(filePath, projectPaths);
+        } finally {
+          timings.packageInventoryMs.push(performance.now() - startedAt);
+        }
+      },
+    };
+    const listProjects: SolutionProjectLister = async (filePath) => {
+      const startedAt = performance.now();
+      try {
+        return await executeDotnet(
+          ['sln', filePath, 'list'],
+          path.dirname(filePath),
+          `Project enumeration for "${filePath}"`
+        );
+      } finally {
+        timings.projectEnumerationMs.push(performance.now() - startedAt);
+      }
+    };
+    const loader = new SolutionLoader(timedProjectLoader, listProjects);
+    let projectCount = 0;
 
-    expect(solution.projects.map((project) => path.basename(project.fsPath))).toEqual(['CpmApp.csproj']);
-    expect(solution.projects[0].packages.find((item) => item.id === 'Microsoft.Extensions.Http')?.version).toBe('10.0.12');
-    expect(solution.projects[0].managePackageVersionsCentrally).toBe(true);
-    expect(solution.projects[0].packages.find((item) => item.id === 'Microsoft.Extensions.Http')?.versionSource).toBe('central');
-    expect(solution.projects[0].packages.find((item) => item.id === 'Azure.Core')?.versionSource).toBe('override');
+    for (let open = 0; open < 2; open++) {
+      const startedAt = performance.now();
+      const solution = await loader.loadSolutionAsync(solutionPath);
+      timings.totalMs.push(performance.now() - startedAt);
+      projectCount = solution.projects.length;
+      expect(solution.projects.map((project) => path.basename(project.fsPath))).toEqual(['CpmApp.csproj']);
+      expect(solution.projects[0].packages.find((item) => item.id === 'Microsoft.Extensions.Http')?.version).toBe('10.0.12');
+      expect(solution.projects[0].managePackageVersionsCentrally).toBe(true);
+      expect(solution.projects[0].packages.find((item) => item.id === 'Microsoft.Extensions.Http')?.versionSource).toBe('central');
+      expect(solution.projects[0].packages.find((item) => item.id === 'Azure.Core')?.versionSource).toBe('override');
+    }
+    console.info(
+      `[Visual NuGet timing] CpmFixture (${projectCount} project): ` +
+        `project-list=${timings.projectEnumerationMs.map((ms) => ms.toFixed(1)).join('/')}ms, ` +
+        `package-inventory=${timings.packageInventoryMs.map((ms) => ms.toFixed(1)).join('/')}ms, ` +
+        `total=${timings.totalMs.map((ms) => ms.toFixed(1)).join('/')}ms (first/reopen)`
+    );
   }, 30_000);
 });

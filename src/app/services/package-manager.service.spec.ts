@@ -308,6 +308,30 @@ describe('PackageManagerService', () => {
     expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(2);
   });
 
+  test('changed solution inventory invalidates cached tab results and uses current package ids', () => {
+    const firstSolution = getMockSolution();
+    firstSolution.projects[0].packages = [{ id: 'Package1', version: '1.0.0', packageLevel: 'direct' }];
+    firstSolution.projects[1].packages = [];
+    const secondSolution = getMockSolution();
+    secondSolution.projects[0].packages = [{ id: 'Package3', version: '2.0.0', packageLevel: 'direct' }];
+    secondSolution.projects[1].packages = [];
+    const source = getMockPackageSource();
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(getMockApiPackages()));
+    service.changeCurrentSolution(firstSolution);
+    service.changeCurrentCategory(Category.Installed);
+    service.queryForPackages('', false, source, false);
+
+    service.changeCurrentSolution(secondSolution);
+    service.queryForPackages('', false, source, false);
+
+    let packageIds: string[] | undefined;
+    service.currentPackages.pipe(take(1)).subscribe((packages) => {
+      packageIds = packages?.map((packageRow) => packageRow.id);
+    });
+    expect(packageIds).toEqual(['Package3']);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(2);
+  });
+
   test('installed prerelease-only summaries add icons without changing installed versions or update counts', () => {
     const project = getMockCurrentProject();
     const prereleaseOnlySummary = { ...getMockApiPackages()[0], version: '', iconUrl: 'https://example.test/icon.png' };

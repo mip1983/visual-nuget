@@ -40,6 +40,30 @@ describe('ProjectFileLoader', () => {
     });
   });
 
+  it('starts solution package listing before project enumeration completes', async () => {
+    const solutionPath = path.resolve('workspace', 'Sample.slnx');
+    const projectPath = path.resolve('workspace', 'App.csproj');
+    let resolveProjectPaths!: (paths: string[]) => void;
+    const projectPaths = new Promise<string[]>((resolve) => {
+      resolveProjectPaths = resolve;
+    });
+    const listSolutionPackages = jest.fn().mockResolvedValue(
+      JSON.stringify({
+        version: 1,
+        projects: [{ path: projectPath, frameworks: [{ framework: 'net8.0', topLevelPackages: [] }] }],
+      })
+    );
+    const loader = new ProjectFileLoader(undefined, undefined, listSolutionPackages);
+
+    const loading = loader.loadSolutionInventoryAsync(solutionPath, projectPaths);
+
+    expect(listSolutionPackages).toHaveBeenCalledWith(solutionPath);
+    resolveProjectPaths([projectPath]);
+    await expect(loading).resolves.toEqual([
+      expect.objectContaining({ fsPath: projectPath, packages: [], packageMetadataComplete: false }),
+    ]);
+  });
+
   it('preserves restored PackageVersion ranges in the fast inventory', async () => {
     const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'visual-nuget-ranges-'));
     try {

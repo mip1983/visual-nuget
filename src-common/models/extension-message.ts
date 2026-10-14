@@ -9,7 +9,9 @@ export type ExtensionMessage =
   | { type: 'sources'; data: PackageSource[] }
   | { type: 'operation-results'; data: PackageOperationResult[]; rollbackId?: string }
   | { type: 'operation-progress'; data: { operationId: string; message: string } }
-  | { type: 'operation-completed'; data: { operationId: string } };
+  | { type: 'operation-completed'; data: { operationId: string } }
+  | { type: 'session-cache-result'; data: { requestId: string; value: string | null } }
+  | { type: 'session-cache-error'; data: { requestId: string; message: string } };
 
 export interface PackageOperationResult {
   projectPath: string;

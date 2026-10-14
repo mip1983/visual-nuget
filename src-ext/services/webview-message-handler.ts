@@ -8,6 +8,10 @@ import {
   PackageUpdateOperation,
   RemovePackageFromProjectsMessage,
   RollbackPackageUpdateMessage,
+  SessionCacheClearMessage,
+  SessionCacheDeleteMessage,
+  SessionCacheGetMessage,
+  SessionCacheSetMessage,
   UIMessage,
   UninstallMessage,
   UpdatePackagesMessage,
@@ -19,6 +23,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import ProjectFileLoader from './project-file-loader';
+import SessionPackageCache from './session-package-cache';
+import SessionSolutionCache from './session-solution-cache';
 import { TaskManager } from './task-manager';
 import SolutionLoader from './solution-loader';
 
@@ -34,6 +40,7 @@ interface RollbackSnapshot {
 }
 
 const maxConcurrentMetadataLoads = 2;
+const maxPendingCacheWriteTimings = 512;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -48,11 +55,15 @@ export default class WebviewMessageHandler {
   private solutionProjects = new Map<string, Project>();
   private loadedSolution: Solution | undefined;
   private readonly rollbackSnapshots = new Map<string, RollbackSnapshot>();
+  private readonly pendingCacheWriteStartedAt = new Map<string, number>();
   private contextLoadSequence = 0;
 
   public constructor(
     private readonly webview: vscode.Webview,
-    private readonly context: { type: 'project' | 'solution'; filePath: string }
+    private readonly context: { type: 'project' | 'solution'; filePath: string },
+    private readonly sessionPackageCache = new SessionPackageCache(),
+    private readonly sessionSolutionCache = new SessionSolutionCache(),
+    private readonly logDiagnostic: (message: string) => void = () => {}
   ) {
     this.projectFileLoader = new ProjectFileLoader();
     this.solutionLoader = new SolutionLoader(this.projectFileLoader);
@@ -104,9 +115,90 @@ export default class WebviewMessageHandler {
         this.loadSolution(message as LoadSolutionMessage);
         this.loadConfiguration();
         return;
+      case 'session-cache-get':
+        this.readSessionCache(message as SessionCacheGetMessage);
+        return;
+      case 'session-cache-set':
+        this.writeSessionCache(message as SessionCacheSetMessage);
+        return;
+      case 'session-cache-delete':
+        this.deleteSessionCache(message as SessionCacheDeleteMessage);
+        return;
+      case 'session-cache-clear':
+        this.sessionPackageCache.clearPackageData((message as SessionCacheClearMessage).sourceUrl);
+        return;
       case 'open-settings':
         this.openSettings();
     }
+  }
+
+  private readSessionCache(message: SessionCacheGetMessage): void {
+    const cacheKey = this.sessionPackageCache.createKey(
+      message.cacheKind,
+      message.sourceUrl,
+      message.authorizationHeader,
+      message.keyParts
+    );
+    const value = this.sessionPackageCache.get(cacheKey) ?? null;
+    if (this.isMetadataCacheKind(message.cacheKind)) {
+      const packageCount =
+        message.cacheKind === 'package-inventory' ? `, packageIds=${Math.max(0, message.keyParts.length - 2)}` : '';
+      this.logDiagnostic(
+        `${message.cacheKind} ${value === null ? 'MISS' : `HIT, bytes=${Buffer.byteLength(value, 'utf8')}`}${packageCount}`
+      );
+      if (value === null) {
+        if (!this.pendingCacheWriteStartedAt.has(cacheKey) && this.pendingCacheWriteStartedAt.size >= maxPendingCacheWriteTimings) {
+          const oldestKey = this.pendingCacheWriteStartedAt.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.pendingCacheWriteStartedAt.delete(oldestKey);
+          }
+        }
+        this.pendingCacheWriteStartedAt.set(cacheKey, Date.now());
+      }
+    }
+
+    this.webview.postMessage({
+      type: 'session-cache-result',
+      data: {
+        requestId: message.requestId,
+        value,
+      },
+    });
+  }
+
+  private writeSessionCache(message: SessionCacheSetMessage): void {
+    const cacheKey = this.sessionPackageCache.createKey(
+      message.cacheKind,
+      message.sourceUrl,
+      message.authorizationHeader,
+      message.keyParts
+    );
+    const startedAt = this.pendingCacheWriteStartedAt.get(cacheKey);
+    this.pendingCacheWriteStartedAt.delete(cacheKey);
+    const byteLength = Buffer.byteLength(message.value, 'utf8');
+    const stored = this.sessionPackageCache.set(cacheKey, message.sourceUrl, message.entryKind, message.value);
+    if (this.isMetadataCacheKind(message.cacheKind)) {
+      const duration = startedAt === undefined ? '' : `, miss-to-store=${Date.now() - startedAt}ms`;
+      this.logDiagnostic(`${message.cacheKind} ${stored ? 'STORED' : 'REJECTED'}, bytes=${byteLength}${duration}`);
+    }
+    if (!stored) {
+      console.warn(`Visual NuGet skipped a ${message.cacheKind} session cache entry (${byteLength} bytes).`);
+    }
+  }
+
+  private isMetadataCacheKind(cacheKind: SessionCacheGetMessage['cacheKind']): boolean {
+    return cacheKind === 'package-inventory' || cacheKind === 'package-summary' || cacheKind === 'package-history';
+  }
+
+  private deleteSessionCache(message: SessionCacheDeleteMessage): void {
+    this.sessionPackageCache.delete(
+      this.sessionPackageCache.createKey(
+        message.cacheKind,
+        message.sourceUrl,
+        message.authorizationHeader,
+        message.keyParts
+      )
+    );
   }
 
   private async addPackage(message: InstallMessage): Promise<void> {
@@ -849,6 +941,13 @@ export default class WebviewMessageHandler {
   }
 
   private postOperationResults(results: PackageOperationResult[], rollbackId?: string, reloadContext = true): void {
+    if (
+      results.some(
+        (result) => result.succeeded && (result.operation === 'add' || result.operation === 'remove' || result.operation === 'rollback')
+      )
+    ) {
+      this.sessionSolutionCache.clear();
+    }
     const message: ExtensionMessage = {
       type: 'operation-results',
       data: results,
@@ -873,12 +972,12 @@ export default class WebviewMessageHandler {
 
   private loadContext(): void {
     const requestId = ++this.contextLoadSequence;
-    this.postContextLoading('Loading project and package references...');
     if (this.context.type === 'solution') {
       this.loadSolution({ command: 'load-solution', solutionFilePath: this.context.filePath }, requestId);
       return;
     }
 
+    this.postContextLoading('Loading project and package references...');
     this.postContextLoading('Loading project package references...');
     void this.loadProjectInventory().then(
       (project) => {
@@ -917,24 +1016,28 @@ export default class WebviewMessageHandler {
   }
 
   private loadSolution(message: LoadSolutionMessage, requestId = ++this.contextLoadSequence): void {
+    const cachedSolution = this.sessionSolutionCache.get(message.solutionFilePath);
+    if (cachedSolution) {
+      this.postLoadedSolution(cachedSolution, requestId);
+      return;
+    }
+
     this.postContextLoading('Finding projects in solution...');
-    void this.solutionLoader.loadSolutionAsync(message.solutionFilePath, ({ completed, total, message: progressMessage }) => {
-      if (requestId === this.contextLoadSequence) {
-        this.postContextLoading(
-          progressMessage ?? `Loading solution projects (${completed} of ${total})...`,
-          completed,
-          total
-        );
-      }
-    }).then(
+    void this.sessionSolutionCache
+      .getOrLoad(message.solutionFilePath, () =>
+        this.solutionLoader.loadSolutionAsync(message.solutionFilePath, ({ completed, total, message: progressMessage }) => {
+          if (requestId === this.contextLoadSequence) {
+            this.postContextLoading(
+              progressMessage ?? `Loading solution projects (${completed} of ${total})...`,
+              completed,
+              total
+            );
+          }
+        })
+      )
+      .then(
       (solution) => {
-        if (requestId !== this.contextLoadSequence) {
-          return;
-        }
-        this.loadedSolution = solution;
-        this.solutionProjects = new Map(solution.projects.map((project) => [project.fsPath, project]));
-        const extensionMessage: ExtensionMessage = { type: 'solution', data: solution };
-        this.webview.postMessage(extensionMessage);
+        this.postLoadedSolution(solution, requestId);
       },
       (error: unknown) => {
         if (requestId === this.contextLoadSequence) {
@@ -942,6 +1045,16 @@ export default class WebviewMessageHandler {
         }
       }
     );
+  }
+
+  private postLoadedSolution(solution: Solution, requestId: number): void {
+    if (requestId !== this.contextLoadSequence) {
+      return;
+    }
+    this.loadedSolution = solution;
+    this.solutionProjects = new Map(solution.projects.map((project) => [project.fsPath, project]));
+    const extensionMessage: ExtensionMessage = { type: 'solution', data: solution };
+    this.webview.postMessage(extensionMessage);
   }
 
   private postContextLoading(message: string, completed?: number, total?: number): void {
@@ -987,6 +1100,7 @@ export default class WebviewMessageHandler {
   }
 
   public dispose(): void {
+    this.pendingCacheWriteStartedAt.clear();
     while (this.disposables.length) {
       const disposable = this.disposables.pop();
       if (disposable) {

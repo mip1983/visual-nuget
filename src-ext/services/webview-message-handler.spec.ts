@@ -61,6 +61,7 @@ jest.mock('vscode', () => {
     },
     workspace: {
       onDidChangeConfiguration: jest.fn(() => ({ dispose: jest.fn() })),
+      getConfiguration: jest.fn(() => ({ sources: [] })),
       textDocuments: [],
     },
     window: {
@@ -75,23 +76,30 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { ExtensionMessage } from '../../src-common/models/extension-message';
-import { Project } from '../../src-common/models/project';
+import { ExtensionMessage, PackageOperationResult } from '../../src-common/models/extension-message';
+import { Project, Solution } from '../../src-common/models/project';
 import {
   InstallMessage,
   InstallPackageInProjectsMessage,
+  LoadSolutionMessage,
   RemovePackageFromProjectsMessage,
   RollbackPackageUpdateMessage,
-  UIMessage,
+  SessionCacheClearMessage,
+  SessionCacheGetMessage,
+  SessionCacheSetMessage,
   UpdatePackagesMessage,
+  WebviewMessage,
 } from '../../src-common/models/ui-message';
 import WebviewMessageHandler from './webview-message-handler';
+import SessionPackageCache from './session-package-cache';
+import SessionSolutionCache from './session-solution-cache';
+import SolutionLoader from './solution-loader';
 
 describe('WebviewMessageHandler package update batches', () => {
   let temporaryDirectory: string;
   let projectPath: string;
   let handler: WebviewMessageHandler;
-  let receiveMessage: ((message: UIMessage) => void) | undefined;
+  let receiveMessage: ((message: WebviewMessage) => void) | undefined;
   let messages: ExtensionMessage[];
   let waitForCompletion: (operationId: string) => Promise<void>;
   let webview: {
@@ -99,6 +107,8 @@ describe('WebviewMessageHandler package update batches', () => {
     postMessage: jest.Mock;
   };
   let waiters: Map<string, () => void>;
+  let sessionPackageCache: SessionPackageCache;
+  let sessionSolutionCache: SessionSolutionCache;
 
   beforeEach(async () => {
     temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'visual-nuget-batch-'));
@@ -118,13 +128,15 @@ describe('WebviewMessageHandler package update batches', () => {
     testHooks.testHooks.taskExitCodes.length = 0;
     waiters = new Map<string, () => void>();
     messages = [];
+    sessionPackageCache = new SessionPackageCache();
+    sessionSolutionCache = new SessionSolutionCache();
     waitForCompletion = (operationId) =>
       new Promise((resolve) => {
         waiters.set(operationId, resolve);
       });
 
     webview = {
-      onDidReceiveMessage: jest.fn((listener: (message: UIMessage) => void) => {
+      onDidReceiveMessage: jest.fn((listener: (message: WebviewMessage) => void) => {
         receiveMessage = listener;
         return { dispose: jest.fn() };
       }),
@@ -137,7 +149,12 @@ describe('WebviewMessageHandler package update batches', () => {
       }),
     };
 
-    handler = new WebviewMessageHandler(webview as unknown as vscode.Webview, { type: 'project', filePath: projectPath });
+    handler = new WebviewMessageHandler(
+      webview as unknown as vscode.Webview,
+      { type: 'project', filePath: projectPath },
+      sessionPackageCache,
+      sessionSolutionCache
+    );
     const privateHandler = handler as unknown as { solutionProjects: Map<string, Project>; loadContext: () => void };
     privateHandler.solutionProjects = new Map([[projectPath, project]]);
     jest.spyOn(privateHandler, 'loadContext').mockImplementation(() => {});
@@ -680,11 +697,265 @@ describe('WebviewMessageHandler package update batches', () => {
     ).toContain('changed after the update');
   });
 
+  test('reuses solution inventory across recreated webview handlers without showing a loading phase', async () => {
+    const solutionPath = path.join(temporaryDirectory, 'Sample.sln');
+    const project: Project = { name: 'Batch', fsPath: projectPath, packages: [] };
+    const solution: Solution = {
+      name: 'Sample',
+      fsPath: solutionPath,
+      projects: [project],
+      unsupportedProjects: [],
+      loadFailures: [],
+    };
+
+    handler.dispose();
+    messages = [];
+    handler = new WebviewMessageHandler(
+      webview as unknown as vscode.Webview,
+      { type: 'solution', filePath: solutionPath },
+      sessionPackageCache,
+      sessionSolutionCache
+    );
+    const firstLoader = new SolutionLoader();
+    const firstLoad = jest.spyOn(firstLoader, 'loadSolutionAsync').mockResolvedValue(solution);
+    (handler as unknown as { solutionLoader: SolutionLoader }).solutionLoader = firstLoader;
+    const firstLoadMessage: LoadSolutionMessage = { command: 'load-solution', solutionFilePath: solutionPath };
+    receiveMessage?.(firstLoadMessage);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(firstLoad).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual({ type: 'solution', data: solution });
+
+    handler.dispose();
+    messages = [];
+    handler = new WebviewMessageHandler(
+      webview as unknown as vscode.Webview,
+      { type: 'solution', filePath: solutionPath },
+      sessionPackageCache,
+      sessionSolutionCache
+    );
+    const reopenedLoader = new SolutionLoader();
+    const reopenedLoad = jest.spyOn(reopenedLoader, 'loadSolutionAsync');
+    (handler as unknown as { solutionLoader: SolutionLoader }).solutionLoader = reopenedLoader;
+    const reopenMessage: LoadSolutionMessage = { command: 'load-solution', solutionFilePath: solutionPath };
+    receiveMessage?.(reopenMessage);
+
+    expect(reopenedLoad).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({ type: 'solution', data: solution });
+    expect(messages.some((message) => message.type === 'context-loading')).toBe(false);
+  });
+
+  test('invalidates cached solution inventory after a successful package edit only', async () => {
+    const solutionPath = path.join(temporaryDirectory, 'Sample.sln');
+    const solution: Solution = {
+      name: 'Sample',
+      fsPath: solutionPath,
+      projects: [],
+      unsupportedProjects: [],
+      loadFailures: [],
+    };
+    await sessionSolutionCache.getOrLoad(solutionPath, () => Promise.resolve(solution));
+    const postOperationResults = (
+      handler as unknown as {
+        postOperationResults: (results: PackageOperationResult[], rollbackId?: string, reloadContext?: boolean) => void;
+      }
+    ).postOperationResults.bind(handler);
+
+    postOperationResults([{ projectPath, packageId: 'Package.Failed', operation: 'add', succeeded: false }], undefined, false);
+    expect(sessionSolutionCache.get(solutionPath)).toEqual(solution);
+
+    postOperationResults(
+      [{ projectPath, packageId: 'Package.One', operation: 'add', succeeded: true }],
+      undefined,
+      false
+    );
+    expect(sessionSolutionCache.get(solutionPath)).toBeUndefined();
+  });
+
+  test('reuses cache values across newly created webview message handlers', () => {
+    const setMessage: SessionCacheSetMessage = {
+      command: 'session-cache-set',
+      cacheKind: 'package-summary',
+      sourceUrl: 'https://feed.example.test',
+      authorizationHeader: 'Bearer test-token',
+      keyParts: ['Package.One', false],
+      entryKind: 'package-data',
+      value: '{"id":"Package.One"}',
+    };
+    receiveMessage?.(setMessage);
+
+    configureSolutionHandler(path.join(temporaryDirectory, 'Another.sln'), []);
+    const getMessage: SessionCacheGetMessage = {
+      command: 'session-cache-get',
+      requestId: 'request-hit',
+      cacheKind: 'package-summary',
+      sourceUrl: 'https://feed.example.test',
+      authorizationHeader: 'Bearer test-token',
+      keyParts: ['Package.One', false],
+    };
+    receiveMessage?.(getMessage);
+
+    expect(messages).toContainEqual({
+      type: 'session-cache-result',
+      data: { requestId: 'request-hit', value: '{"id":"Package.One"}' },
+    });
+  });
+
+  test('returns a cache miss and clears only package data for the requested source', () => {
+    receiveMessage?.({
+      command: 'session-cache-set',
+      cacheKind: 'package-search',
+      sourceUrl: 'https://one.example.test',
+      keyParts: ['query', false],
+      entryKind: 'package-data',
+      value: '[]',
+    });
+    receiveMessage?.({
+      command: 'session-cache-set',
+      cacheKind: 'service-index',
+      sourceUrl: 'https://one.example.test',
+      keyParts: [],
+      entryKind: 'service-index',
+      value: '{"resources":[]}',
+    });
+    receiveMessage?.({
+      command: 'session-cache-set',
+      cacheKind: 'package-search',
+      sourceUrl: 'https://two.example.test',
+      keyParts: ['query', false],
+      entryKind: 'package-data',
+      value: '[]',
+    });
+    const clearMessage: SessionCacheClearMessage = {
+      command: 'session-cache-clear',
+      sourceUrl: 'https://one.example.test',
+    };
+    receiveMessage?.(clearMessage);
+
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'package-miss',
+      cacheKind: 'package-search',
+      sourceUrl: 'https://one.example.test',
+      keyParts: ['query', false],
+    });
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'index-hit',
+      cacheKind: 'service-index',
+      sourceUrl: 'https://one.example.test',
+      keyParts: [],
+    });
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'other-feed-hit',
+      cacheKind: 'package-search',
+      sourceUrl: 'https://two.example.test',
+      keyParts: ['query', false],
+    });
+
+    expect(messages).toContainEqual({
+      type: 'session-cache-result',
+      data: { requestId: 'package-miss', value: null },
+    });
+    expect(messages).toContainEqual({
+      type: 'session-cache-result',
+      data: { requestId: 'index-hit', value: '{"resources":[]}' },
+    });
+    expect(messages).toContainEqual({
+      type: 'session-cache-result',
+      data: { requestId: 'other-feed-hit', value: '[]' },
+    });
+  });
+
+  test('reports metadata cache hits, misses and fill duration without logging package or feed identity', () => {
+    const diagnosticLines: string[] = [];
+    handler.dispose();
+    handler = new WebviewMessageHandler(
+      webview as unknown as vscode.Webview,
+      { type: 'project', filePath: projectPath },
+      sessionPackageCache,
+      sessionSolutionCache,
+      (message) => diagnosticLines.push(message)
+    );
+    const sourceUrl = 'https://private-feed.example.test/v3/index.json';
+    const packageIds = ['Private.Package.One', 'Private.Package.Two'];
+
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'inventory-miss',
+      cacheKind: 'package-inventory',
+      sourceUrl,
+      authorizationHeader: 'Bearer sensitive-token',
+      keyParts: ['', false, ...packageIds],
+    });
+
+    receiveMessage?.({
+      command: 'session-cache-set',
+      cacheKind: 'package-inventory',
+      sourceUrl,
+      authorizationHeader: 'Bearer sensitive-token',
+      keyParts: ['', false, ...packageIds],
+      entryKind: 'package-data',
+      value: '[]',
+    });
+
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'inventory-hit',
+      cacheKind: 'package-inventory',
+      sourceUrl,
+      authorizationHeader: 'Bearer sensitive-token',
+      keyParts: ['', false, ...packageIds],
+    });
+
+    expect(diagnosticLines[0]).toBe('package-inventory MISS, packageIds=2');
+    expect(diagnosticLines[1]).toMatch(/^package-inventory STORED, bytes=\d+, miss-to-store=\d+ms$/);
+    expect(diagnosticLines[2]).toMatch(/^package-inventory HIT, bytes=2, packageIds=2$/);
+    expect(diagnosticLines.join('\n')).not.toContain('private-feed.example.test');
+    expect(diagnosticLines.join('\n')).not.toContain('sensitive-token');
+    expect(diagnosticLines.join('\n')).not.toContain('Private.Package');
+  });
+
+  test('deletes cache entries by their scoped key', () => {
+    receiveMessage?.({
+      command: 'session-cache-set',
+      cacheKind: 'package-summary',
+      sourceUrl: 'https://feed.example.test',
+      keyParts: ['Package.One', false],
+      entryKind: 'package-data',
+      value: '{"id":"Package.One"}',
+    });
+    receiveMessage?.({
+      command: 'session-cache-delete',
+      cacheKind: 'package-summary',
+      sourceUrl: 'https://feed.example.test',
+      keyParts: ['Package.One', false],
+    });
+    receiveMessage?.({
+      command: 'session-cache-get',
+      requestId: 'deleted-entry',
+      cacheKind: 'package-summary',
+      sourceUrl: 'https://feed.example.test',
+      keyParts: ['Package.One', false],
+    });
+
+    expect(messages).toContainEqual({
+      type: 'session-cache-result',
+      data: { requestId: 'deleted-entry', value: null },
+    });
+  });
+
   function configureSolutionHandler(solutionPath: string, projects: Project[]): void {
     handler.dispose();
     messages = [];
     waiters.clear();
-    handler = new WebviewMessageHandler(webview as unknown as vscode.Webview, { type: 'solution', filePath: solutionPath });
+    handler = new WebviewMessageHandler(
+      webview as unknown as vscode.Webview,
+      { type: 'solution', filePath: solutionPath },
+      sessionPackageCache,
+      sessionSolutionCache
+    );
     const privateHandler = handler as unknown as { solutionProjects: Map<string, Project>; loadContext: () => void };
     privateHandler.solutionProjects = new Map(projects.map((project) => [project.fsPath, project]));
     jest.spyOn(privateHandler, 'loadContext').mockImplementation(() => {});

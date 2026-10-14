@@ -1,14 +1,65 @@
 import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { Injectable } from '@angular/core';
-import { catchError, from, map, mergeMap, Observable, of, shareReplay, switchMap, throwError, toArray } from 'rxjs';
+import { catchError, from, map, mergeMap, Observable, of, shareReplay, switchMap, tap, throwError, toArray } from 'rxjs';
 import { prerelease } from 'semver';
 
 import { PackageSource } from '../../../src-common/models/package-source';
+import { SessionCacheKeyPart, SessionCacheKind } from '../../../src-common/models/ui-message';
 import { ApiIndexResponse, ApiResource } from '../models/api-index-response';
 import { CatalogEntry, PackageMetaResponse, RegistrationLeaf, RegistrationPage } from '../models/package-meta';
 import { PackageRowModel } from '../models/package-row-model';
 import { PackageSearchResult, SearchResults } from '../models/search-results';
+import { VscodeService } from './vscode.service';
 import { VersionService } from './version.service';
+
+type SessionCacheEntryKind = 'package-data' | 'service-index';
+
+interface CacheParseResult {
+  valid: boolean;
+  value?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isApiIndexResponse(value: unknown): value is ApiIndexResponse {
+  return (
+    isRecord(value) &&
+    Array.isArray(value['resources']) &&
+    value['resources'].every(
+      (resource: unknown) =>
+        isRecord(resource) && typeof resource['@id'] === 'string' && typeof resource['@type'] === 'string'
+    )
+  );
+}
+
+function isPackageRowModel(value: unknown): value is PackageRowModel {
+  return (
+    isRecord(value) &&
+    typeof value['id'] === 'string' &&
+    typeof value['version'] === 'string' &&
+    typeof value['description'] === 'string' &&
+    typeof value['iconUrl'] === 'string' &&
+    typeof value['verified'] === 'boolean' &&
+    typeof value['installedVersion'] === 'string' &&
+    typeof value['isInstalled'] === 'boolean' &&
+    typeof value['isOutdated'] === 'boolean' &&
+    typeof value['sourceUrl'] === 'string' &&
+    (value['authors'] === undefined ||
+      typeof value['authors'] === 'string' ||
+      (Array.isArray(value['authors']) && value['authors'].every((author: unknown) => typeof author === 'string'))) &&
+    (value['versions'] === undefined || Array.isArray(value['versions']))
+  );
+}
+
+function isPackageRowModels(value: unknown): value is PackageRowModel[] {
+  return Array.isArray(value) && value.every(isPackageRowModel);
+}
+
+function isPackageRowModelOrNull(value: unknown): value is PackageRowModel | null {
+  return value === null || isPackageRowModel(value);
+}
 
 @Injectable({
   providedIn: 'root',
@@ -40,7 +91,7 @@ export class NuGetApiService {
     this.REGISTRATIONS_BASE_URL,
   ];
 
-  constructor(private http: HttpClient, private versionService: VersionService) {}
+  constructor(private http: HttpClient, private versionService: VersionService, private vscodeService: VscodeService) {}
 
   public clearPackageCache(source: PackageSource): void {
     const sourceCachePrefix = `${JSON.stringify([source.url, source.authorizationHeader ?? '']).slice(0, -1)},`;
@@ -49,6 +100,7 @@ export class NuGetApiService {
         .filter((cacheKey) => cacheKey.startsWith(sourceCachePrefix))
         .forEach((cacheKey) => cache.delete(cacheKey));
     });
+    this.vscodeService.clearSessionPackageCache(source.url);
   }
 
   public search(query: string, prerelease: boolean, source: PackageSource): Observable<PackageRowModel[]> {
@@ -60,13 +112,19 @@ export class NuGetApiService {
 
     const requestHeaders = this.composeRequestHeaders(source.authorizationHeader);
 
-    const searchRequest = this.getApiUrl(source.url, requestHeaders, this.searchQueryServiceEndpoints).pipe(
-      switchMap((searchApiUrl: string) => {
-        return this.executeSearch(query, prerelease, searchApiUrl, requestHeaders);
-      }),
-      map((results: SearchResults) => {
-        return this.mapSearchResultsToPackageRows(results.data, source.url);
-      }),
+    const searchRequest = this.useSessionCache(
+      'package-search',
+      source.url,
+      source.authorizationHeader,
+      [query, prerelease],
+      'package-data',
+      () =>
+        this.getApiUrl(source.url, requestHeaders, this.searchQueryServiceEndpoints).pipe(
+          switchMap((searchApiUrl: string) => this.executeSearch(query, prerelease, searchApiUrl, requestHeaders)),
+          map((results: SearchResults) => this.mapSearchResultsToPackageRows(results.data, source.url))
+        ),
+      isPackageRowModels
+    ).pipe(
       catchError((error: unknown) => {
         this.packageSearchCache.delete(cacheKey);
         return throwError(() => error);
@@ -115,10 +173,20 @@ export class NuGetApiService {
     prerelease: boolean,
     source: PackageSource
   ): Observable<PackageRowModel[]> {
-    return from(packageIds).pipe(
-      mergeMap((packageId) => this.getPackageSummary(packageId, prerelease, source), this.metadataRequestConcurrency),
-      toArray(),
-      map((results) => this.filterAndSortPackageRowResults(results, query))
+    const normalizedPackageIds = packageIds.map((packageId) => packageId.toLowerCase()).sort();
+    return this.useSessionCache(
+      'package-inventory',
+      source.url,
+      source.authorizationHeader,
+      [query, prerelease, ...normalizedPackageIds],
+      'package-data',
+      () =>
+        from(packageIds).pipe(
+          mergeMap((packageId) => this.getPackageSummary(packageId, prerelease, source), this.metadataRequestConcurrency),
+          toArray(),
+          map((results) => this.filterAndSortPackageRowResults(results, query))
+        ),
+      isPackageRowModels
     );
   }
 
@@ -135,54 +203,64 @@ export class NuGetApiService {
     }
 
     let searchEndpointAvailable = true;
-    const summaryRequest = this.searchSinglePackageSummary(packageId, includePrerelease, source).pipe(
-      catchError((error: unknown) => {
-        if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
-          searchEndpointAvailable = false;
-          return this.searchRegistrationSummary(packageId, includePrerelease, source);
-        }
-        return throwError(() => error);
-      }),
-      switchMap((summary) => {
-        if (summary || includePrerelease) {
-          return summary ? of(summary) : this.searchRegistrationSummary(packageId, includePrerelease, source);
-        }
-
-        const prereleaseSummaryRequest = searchEndpointAvailable
-          ? this.searchSinglePackageSummary(packageId, true, source).pipe(
-              catchError((error: unknown) => {
-                if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
-                  return of(null);
-                }
-                return throwError(() => error);
-              })
-            )
-          : of(null);
-
-        return prereleaseSummaryRequest.pipe(
-          switchMap((prereleaseSummary) => {
-            if (prereleaseSummary) {
-              return prerelease(prereleaseSummary.version) !== null
-                ? of({ ...prereleaseSummary, version: '' })
-                : of(prereleaseSummary);
+    const summaryRequest = this.useSessionCache(
+      'package-summary',
+      source.url,
+      source.authorizationHeader,
+      [packageId.toLowerCase(), includePrerelease],
+      'package-data',
+      () =>
+        this.searchSinglePackageSummary(packageId, includePrerelease, source).pipe(
+          catchError((error: unknown) => {
+            if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
+              searchEndpointAvailable = false;
+              return this.searchRegistrationSummary(packageId, includePrerelease, source);
+            }
+            return throwError(() => error);
+          }),
+          switchMap((summary) => {
+            if (summary || includePrerelease) {
+              return summary ? of(summary) : this.searchRegistrationSummary(packageId, includePrerelease, source);
             }
 
-            return this.searchRegistrationSummary(packageId, false, source).pipe(
-              switchMap((stableSummary) =>
-                stableSummary
-                  ? of(stableSummary)
-                  : this.searchRegistrationSummary(packageId, true, source).pipe(
-                      map((prereleaseRegistration) =>
-                        prereleaseRegistration && prerelease(prereleaseRegistration.version) !== null
-                          ? { ...prereleaseRegistration, version: '' }
-                          : prereleaseRegistration
-                      )
-                    )
-              )
+            const prereleaseSummaryRequest = searchEndpointAvailable
+              ? this.searchSinglePackageSummary(packageId, true, source).pipe(
+                  catchError((error: unknown) => {
+                    if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
+                      return of(null);
+                    }
+                    return throwError(() => error);
+                  })
+                )
+              : of(null);
+
+            return prereleaseSummaryRequest.pipe(
+              switchMap((prereleaseSummary) => {
+                if (prereleaseSummary) {
+                  return prerelease(prereleaseSummary.version) !== null
+                    ? of({ ...prereleaseSummary, version: '' })
+                    : of(prereleaseSummary);
+                }
+
+                return this.searchRegistrationSummary(packageId, false, source).pipe(
+                  switchMap((stableSummary) =>
+                    stableSummary
+                      ? of(stableSummary)
+                      : this.searchRegistrationSummary(packageId, true, source).pipe(
+                          map((prereleaseRegistration) =>
+                            prereleaseRegistration && prerelease(prereleaseRegistration.version) !== null
+                              ? { ...prereleaseRegistration, version: '' }
+                              : prereleaseRegistration
+                          )
+                        )
+                  )
+                );
+              })
             );
           })
-        );
-      }),
+        ),
+      isPackageRowModelOrNull
+    ).pipe(
       catchError((error: unknown) => {
         this.packageSummaryCache.delete(cacheKey);
         return throwError(() => error);
@@ -237,8 +315,18 @@ export class NuGetApiService {
       return cachedHistory;
     }
 
-    const historyRequest = this.executeMetadataGets([packageId], '', includePrerelease, metaApiUrl, requestHeaders, source.url).pipe(
-      map((packages) => packages[0] ?? null),
+    const historyRequest = this.useSessionCache(
+      'package-history',
+      source.url,
+      source.authorizationHeader,
+      [packageId.toLowerCase(), includePrerelease],
+      'package-data',
+      () =>
+        this.executeMetadataGets([packageId], '', includePrerelease, metaApiUrl, requestHeaders, source.url).pipe(
+          map((packages) => packages[0] ?? null)
+        ),
+      isPackageRowModelOrNull
+    ).pipe(
       catchError((error: unknown) => {
         this.packageHistoryCache.delete(cacheKey);
         return throwError(() => error);
@@ -419,15 +507,66 @@ export class NuGetApiService {
     return lowerId.includes(trimmedLowerQuery) || lowerDescription.includes(trimmedLowerQuery);
   }
 
+  private useSessionCache<T>(
+    cacheKind: SessionCacheKind,
+    sourceUrl: string,
+    authorizationHeader: string | undefined,
+    keyParts: SessionCacheKeyPart[],
+    entryKind: SessionCacheEntryKind,
+    request: () => Observable<T>,
+    isCachedValue: (value: unknown) => value is T
+  ): Observable<T> {
+    const requestAndCache = () =>
+      request().pipe(
+        tap((value) => {
+          const serialized = JSON.stringify(value);
+          if (serialized === undefined) {
+            throw new Error(`Could not serialize ${cacheKind} data for the session cache.`);
+          }
+          this.vscodeService.setSessionCache(cacheKind, sourceUrl, authorizationHeader, keyParts, entryKind, serialized);
+        })
+      );
+
+    return this.vscodeService.getSessionCache(cacheKind, sourceUrl, authorizationHeader, keyParts).pipe(
+      switchMap((serializedValue) => {
+        if (serializedValue !== null) {
+          const parsedValue = this.parseCacheValue(serializedValue);
+          if (parsedValue.valid && isCachedValue(parsedValue.value)) {
+            return of(parsedValue.value);
+          }
+          this.vscodeService.deleteSessionCache(cacheKind, sourceUrl, authorizationHeader, keyParts);
+        }
+
+        return requestAndCache();
+      })
+    );
+  }
+
+  private parseCacheValue(serializedValue: string): CacheParseResult {
+    try {
+      return { valid: true, value: JSON.parse(serializedValue) as unknown };
+    } catch {
+      return { valid: false };
+    }
+  }
+
   private getApiUrl(sourceUrl: string, requestHeaders: HttpHeaders, preferedEndpoints: string[]): Observable<string> {
-    const cacheKey = JSON.stringify([sourceUrl, requestHeaders.get(this.AUTHORIZATION_HEADER) ?? '']);
+    const authorizationHeader = requestHeaders.get(this.AUTHORIZATION_HEADER) ?? undefined;
+    const cacheKey = JSON.stringify([sourceUrl, authorizationHeader ?? '']);
     let serviceIndexRequest = this.serviceIndexCache.get(cacheKey);
     if (!serviceIndexRequest) {
-      serviceIndexRequest = this.http
-        .get<ApiIndexResponse>(sourceUrl, {
-          headers: requestHeaders,
-        })
-        .pipe(
+      serviceIndexRequest = this.useSessionCache(
+        'service-index',
+        sourceUrl,
+        authorizationHeader,
+        [],
+        'service-index',
+        () =>
+          this.http.get<ApiIndexResponse>(sourceUrl, {
+            headers: requestHeaders,
+          }),
+        isApiIndexResponse
+      ).pipe(
           catchError((error: unknown) => {
             this.serviceIndexCache.delete(cacheKey);
             return throwError(() => error);
