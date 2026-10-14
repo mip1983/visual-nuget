@@ -43,3 +43,7 @@ testem.log
 Thumbs.db
 
 *.vsix
+
+# .NET build output
+**/[Bb]in/
+**/[Oo]bj/
