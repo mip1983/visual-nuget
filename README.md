@@ -33,7 +33,7 @@ In solution mode, the **Consolidate** tab appears only when a package has differ
 
 When updating a CPM package in a solution, known project-level overrides and framework-specific versions are preserved by default. For explicitly checked projects, enable **Also update package overrides and framework-specific versions** to include those entries. Individual install and uninstall operations do not roll back successful changes in other projects. Transitive package information comes from the project's restore graph; restore the project if that information is unavailable.
 
-Solution support is an initial implementation: unsupported project types are skipped and reported, and projects that MSBuild cannot evaluate are shown as load failures. It does not yet provide full Visual Studio solution-level package-management parity.
+Solution support is an initial implementation: unsupported project types are skipped and reported, and projects that MSBuild cannot evaluate are shown as load failures.
 
 ## Vulnerability and deprecation information
 
