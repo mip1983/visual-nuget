@@ -699,6 +699,8 @@ describe('WebviewMessageHandler package update batches', () => {
 
   test('reuses solution inventory across recreated webview handlers without showing a loading phase', async () => {
     const solutionPath = path.join(temporaryDirectory, 'Sample.sln');
+    const diagnosticLines: string[] = [];
+    const logDiagnostic = (message: string) => diagnosticLines.push(message);
     const project: Project = { name: 'Batch', fsPath: projectPath, packages: [] };
     const solution: Solution = {
       name: 'Sample',
@@ -714,7 +716,8 @@ describe('WebviewMessageHandler package update batches', () => {
       webview as unknown as vscode.Webview,
       { type: 'solution', filePath: solutionPath },
       sessionPackageCache,
-      sessionSolutionCache
+      sessionSolutionCache,
+      logDiagnostic
     );
     const firstLoader = new SolutionLoader();
     const firstLoad = jest.spyOn(firstLoader, 'loadSolutionAsync').mockResolvedValue(solution);
@@ -725,6 +728,10 @@ describe('WebviewMessageHandler package update batches', () => {
 
     expect(firstLoad).toHaveBeenCalledTimes(1);
     expect(messages).toContainEqual({ type: 'solution', data: solution });
+    expect(diagnosticLines).toContain('solution-inventory MISS');
+    expect(diagnosticLines.some((line) => /^solution-inventory LOAD_COMPLETE, projects=1, retained=true, duration=\d+ms$/.test(line))).toBe(
+      true
+    );
 
     handler.dispose();
     messages = [];
@@ -732,7 +739,8 @@ describe('WebviewMessageHandler package update batches', () => {
       webview as unknown as vscode.Webview,
       { type: 'solution', filePath: solutionPath },
       sessionPackageCache,
-      sessionSolutionCache
+      sessionSolutionCache,
+      logDiagnostic
     );
     const reopenedLoader = new SolutionLoader();
     const reopenedLoad = jest.spyOn(reopenedLoader, 'loadSolutionAsync');
@@ -743,6 +751,7 @@ describe('WebviewMessageHandler package update batches', () => {
     expect(reopenedLoad).not.toHaveBeenCalled();
     expect(messages).toContainEqual({ type: 'solution', data: solution });
     expect(messages.some((message) => message.type === 'context-loading')).toBe(false);
+    expect(diagnosticLines).toContain('solution-inventory HIT, projects=1');
   });
 
   test('invalidates cached solution inventory after a successful package edit only', async () => {

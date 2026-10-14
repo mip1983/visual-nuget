@@ -946,7 +946,11 @@ export default class WebviewMessageHandler {
         (result) => result.succeeded && (result.operation === 'add' || result.operation === 'remove' || result.operation === 'rollback')
       )
     ) {
+      const cachedEntryCount = this.sessionSolutionCache.entryCount;
       this.sessionSolutionCache.clear();
+      if (cachedEntryCount > 0) {
+        this.logDiagnostic(`solution-inventory INVALIDATED, reason=successful-package-edit, entries=${cachedEntryCount}`);
+      }
     }
     const message: ExtensionMessage = {
       type: 'operation-results',
@@ -1018,10 +1022,13 @@ export default class WebviewMessageHandler {
   private loadSolution(message: LoadSolutionMessage, requestId = ++this.contextLoadSequence): void {
     const cachedSolution = this.sessionSolutionCache.get(message.solutionFilePath);
     if (cachedSolution) {
+      this.logDiagnostic(`solution-inventory HIT, projects=${cachedSolution.projects.length}`);
       this.postLoadedSolution(cachedSolution, requestId);
       return;
     }
 
+    const startedAt = Date.now();
+    this.logDiagnostic('solution-inventory MISS');
     this.postContextLoading('Finding projects in solution...');
     void this.sessionSolutionCache
       .getOrLoad(message.solutionFilePath, () =>
@@ -1037,9 +1044,14 @@ export default class WebviewMessageHandler {
       )
       .then(
       (solution) => {
+        const retained = this.sessionSolutionCache.get(message.solutionFilePath) === solution;
+        this.logDiagnostic(
+          `solution-inventory LOAD_COMPLETE, projects=${solution.projects.length}, retained=${retained}, duration=${Date.now() - startedAt}ms`
+        );
         this.postLoadedSolution(solution, requestId);
       },
       (error: unknown) => {
+        this.logDiagnostic(`solution-inventory LOAD_FAILED, duration=${Date.now() - startedAt}ms`);
         if (requestId === this.contextLoadSequence) {
           this.postContextLoadError(error);
         }

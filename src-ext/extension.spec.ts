@@ -18,22 +18,37 @@ jest.mock('vscode', () => ({
     file: jest.fn((fsPath: string) => ({ fsPath })),
   },
   workspace: (() => {
-    const fileChangeListeners: Array<() => void> = [];
+    const fileCreateListeners: Array<(uri: { fsPath: string }) => void> = [];
+    const fileChangeListeners: Array<(uri: { fsPath: string }) => void> = [];
+    const fileDeleteListeners: Array<(uri: { fsPath: string }) => void> = [];
     const workspaceFolderChangeListeners: Array<() => void> = [];
-    const register = (listeners: Array<() => void>, listener: () => void) => {
+    const registerWorkspaceFolderChange = (listener: () => void) => {
+      workspaceFolderChangeListeners.push(listener);
+      return { dispose: jest.fn() };
+    };
+    const registerFileListener = (
+      listeners: Array<(uri: { fsPath: string }) => void>,
+      listener: (uri: { fsPath: string }) => void
+    ) => {
       listeners.push(listener);
       return { dispose: jest.fn() };
     };
     return {
       createFileSystemWatcher: jest.fn(() => ({
-        onDidCreate: jest.fn((listener: () => void) => register(fileChangeListeners, listener)),
-        onDidChange: jest.fn((listener: () => void) => register(fileChangeListeners, listener)),
-        onDidDelete: jest.fn((listener: () => void) => register(fileChangeListeners, listener)),
+        onDidCreate: jest.fn((listener: (uri: { fsPath: string }) => void) =>
+          registerFileListener(fileCreateListeners, listener)
+        ),
+        onDidChange: jest.fn((listener: (uri: { fsPath: string }) => void) =>
+          registerFileListener(fileChangeListeners, listener)
+        ),
+        onDidDelete: jest.fn((listener: (uri: { fsPath: string }) => void) =>
+          registerFileListener(fileDeleteListeners, listener)
+        ),
         dispose: jest.fn(),
       })),
       getWorkspaceFolder: jest.fn(() => ({ uri: { fsPath: 'workspace' } })),
-      onDidChangeWorkspaceFolders: jest.fn((listener: () => void) => register(workspaceFolderChangeListeners, listener)),
-      testHooks: { fileChangeListeners, workspaceFolderChangeListeners },
+      onDidChangeWorkspaceFolders: jest.fn(registerWorkspaceFolderChange),
+      testHooks: { fileCreateListeners, fileChangeListeners, fileDeleteListeners, workspaceFolderChangeListeners },
     };
   })(),
 }));
@@ -60,7 +75,7 @@ describe('extension session package cache lifetime', () => {
       ])
     );
     const projectUri = { fsPath: 'App.csproj' } as vscode.Uri;
-    const solutionUri = { fsPath: 'Workspace.sln' } as vscode.Uri;
+    const solutionUri = { fsPath: 'Workspace.slnx' } as vscode.Uri;
     const projectCommand = commandCallbacks.get('visualnuget.managePackages');
     const projectPaletteCommand = commandCallbacks.get('visualnuget.managePackagesPalette');
     const solutionCommand = commandCallbacks.get('visualnuget.manageSolutionPackages');
@@ -143,16 +158,38 @@ describe('extension session package cache lifetime', () => {
     const workspace = vscode.workspace as unknown as {
       createFileSystemWatcher: jest.Mock;
       testHooks: {
-        fileChangeListeners: Array<() => void>;
+        fileCreateListeners: Array<(uri: { fsPath: string }) => void>;
+        fileChangeListeners: Array<(uri: { fsPath: string }) => void>;
+        fileDeleteListeners: Array<(uri: { fsPath: string }) => void>;
         workspaceFolderChangeListeners: Array<() => void>;
       };
     };
     expect(workspace.createFileSystemWatcher).toHaveBeenCalledWith(expect.stringContaining('project.assets.json'));
-    for (const invalidate of workspace.testHooks.fileChangeListeners) {
+    for (const invalidate of [
+      ...workspace.testHooks.fileCreateListeners,
+      ...workspace.testHooks.fileChangeListeners,
+      ...workspace.testHooks.fileDeleteListeners,
+    ]) {
       await sharedSolutionCache.getOrLoad(inventory.fsPath, () => Promise.resolve(inventory));
-      invalidate();
+      invalidate({ fsPath: 'C:\\workspace\\project.assets.json' });
       expect(sharedSolutionCache.get(inventory.fsPath)).toBeUndefined();
     }
+    expect(diagnosticOutput.appendLine).toHaveBeenCalledWith(
+      'solution-inventory INVALIDATED, reason=watched-file-created, filePath=C:\\workspace\\project.assets.json, entries=1'
+    );
+
+    await sharedSolutionCache.getOrLoad(inventory.fsPath, () => Promise.resolve(inventory));
+    workspace.testHooks.fileCreateListeners[0]?.({ fsPath: 'C:\\workspace\\.csdevkit-dtb-temp.sln' });
+    expect(sharedSolutionCache.get(inventory.fsPath)).toEqual(inventory);
+    expect(diagnosticOutput.appendLine).toHaveBeenCalledWith(
+      'solution-inventory FILE_EVENT, reason=watched-file-created, filePath=C:\\workspace\\.csdevkit-dtb-temp.sln, invalidated=false'
+    );
+
+    workspace.testHooks.fileCreateListeners[0]?.({ fsPath: inventory.fsPath });
+    expect(sharedSolutionCache.get(inventory.fsPath)).toBeUndefined();
+    expect(diagnosticOutput.appendLine).toHaveBeenCalledWith(
+      'solution-inventory FILE_EVENT, reason=watched-file-created, filePath=Workspace.slnx, invalidated=true'
+    );
 
     await sharedSolutionCache.getOrLoad(inventory.fsPath, () => Promise.resolve(inventory));
     workspace.testHooks.workspaceFolderChangeListeners[0]?.();

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { Solution } from '../src-common/models/project';
 import * as quickPick from './services/quick-pick';
 
@@ -32,15 +33,32 @@ export function activate(context: vscode.ExtensionContext) {
   const diagnosticOutput = vscode.window.createOutputChannel('Visual NuGet');
   const sessionPackageCache = new SessionPackageCache();
   const sessionSolutionCache = new SessionSolutionCache(isSolutionInputWatched);
-  const invalidateSolutionCache = () => sessionSolutionCache.clear();
+  const invalidateSolutionCache = (reason: string, uri?: vscode.Uri) => {
+    if (uri && ['.sln', '.slnx'].includes(path.extname(uri.fsPath).toLowerCase())) {
+      const invalidated = sessionSolutionCache.invalidate(uri.fsPath);
+      diagnosticOutput.appendLine(
+        `solution-inventory FILE_EVENT, reason=${reason}, filePath=${uri.fsPath}, invalidated=${invalidated}`
+      );
+      return;
+    }
+
+    const cachedEntryCount = sessionSolutionCache.entryCount;
+    sessionSolutionCache.clear();
+    if (cachedEntryCount > 0) {
+      const filePath = uri ? `, filePath=${uri.fsPath}` : '';
+      diagnosticOutput.appendLine(
+        `solution-inventory INVALIDATED, reason=${reason}${filePath}, entries=${cachedEntryCount}`
+      );
+    }
+  };
   const solutionInputWatcher = vscode.workspace.createFileSystemWatcher(solutionInventoryWatchPattern);
   context.subscriptions.push(
     diagnosticOutput,
     solutionInputWatcher,
-    solutionInputWatcher.onDidCreate(invalidateSolutionCache),
-    solutionInputWatcher.onDidChange(invalidateSolutionCache),
-    solutionInputWatcher.onDidDelete(invalidateSolutionCache),
-    vscode.workspace.onDidChangeWorkspaceFolders(invalidateSolutionCache),
+    solutionInputWatcher.onDidCreate((uri) => invalidateSolutionCache('watched-file-created', uri)),
+    solutionInputWatcher.onDidChange((uri) => invalidateSolutionCache('watched-file-changed', uri)),
+    solutionInputWatcher.onDidDelete((uri) => invalidateSolutionCache('watched-file-deleted', uri)),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => invalidateSolutionCache('workspace-folders-changed')),
     {
       dispose: () => {
         sessionPackageCache.clear();

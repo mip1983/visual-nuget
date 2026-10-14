@@ -27,6 +27,20 @@ export default class SessionSolutionCache {
     return entry.solution;
   }
 
+  public invalidate(solutionFilePath: string): boolean {
+    const key = this.createKey(solutionFilePath);
+    if (!this.entries.has(key)) {
+      return false;
+    }
+
+    this.delete(key);
+    return true;
+  }
+
+  public get entryCount(): number {
+    return this.entries.size;
+  }
+
   public getOrLoad(solutionFilePath: string, load: () => Promise<Solution>): Promise<Solution> {
     const key = this.createKey(solutionFilePath);
     const existing = this.entries.get(key);
