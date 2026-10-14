@@ -14,13 +14,16 @@ describe('PackageListComponent', () => {
   let fixture: ComponentFixture<PackageListComponent>;
   let category: BehaviorSubject<Category>;
   let packageError: BehaviorSubject<string | null>;
+  let contextLoading: BehaviorSubject<{ message: string; completed?: number; total?: number } | null>;
 
   beforeEach(async () => {
     category = new BehaviorSubject<Category>(Category.Browse);
     packageError = new BehaviorSubject<string | null>(null);
+    contextLoading = new BehaviorSubject<{ message: string; completed?: number; total?: number } | null>(null);
     const packageManagerMock = {
       currentPackages: new BehaviorSubject<PackageRowModel[] | null>(null),
       currentPackagesError: packageError,
+      contextLoading,
       currentSelectedPackageId: new BehaviorSubject<string | null>(null),
       currentCategory: category,
       currentSolution: new BehaviorSubject<Solution | null>(null),
@@ -85,6 +88,13 @@ describe('PackageListComponent', () => {
 
     expect(fixture.nativeElement.querySelector('[role="alert"]')?.textContent.trim()).toBe(error);
     expect(fixture.nativeElement.querySelector('app-loading-spinner')).toBeNull();
+  });
+
+  test('does not show an empty result while the solution is loading', () => {
+    contextLoading.next({ message: 'Loading solution projects (2 of 8)...', completed: 2, total: 8 });
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('.no-packages')).toBeNull();
   });
 });
 

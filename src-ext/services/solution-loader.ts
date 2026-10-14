@@ -3,10 +3,18 @@ import { Project, ProjectLoadFailure, Solution } from '../../src-common/models/p
 import ProjectFileLoader from './project-file-loader';
 import { executeDotnet } from './dotnet-cli';
 
-type ProjectLoader = Pick<ProjectFileLoader, 'loadProjectAsync'>;
+type ProjectLoader = Pick<ProjectFileLoader, 'loadProjectAsync'> &
+  Partial<Pick<ProjectFileLoader, 'loadSolutionInventoryAsync'>>;
 export type SolutionProjectLister = (solutionFilePath: string) => Promise<string>;
 
+export interface SolutionLoadProgress {
+  completed: number;
+  total: number;
+  message?: string;
+}
+
 const supportedProjectExtensions = new Set(['.csproj', '.vbproj', '.fsproj']);
+const maxConcurrentProjectLoads = 2;
 
 function runSolutionList(solutionFilePath: string): Promise<string> {
   return executeDotnet(['sln', solutionFilePath, 'list'], path.dirname(solutionFilePath), `Project enumeration for "${solutionFilePath}"`);
@@ -39,12 +47,15 @@ export default class SolutionLoader {
     private readonly listProjects: SolutionProjectLister = runSolutionList
   ) {}
 
-  public async loadSolutionAsync(solutionFilePath: string): Promise<Solution> {
+  public async loadSolutionAsync(
+    solutionFilePath: string,
+    onProgress?: (progress: SolutionLoadProgress) => void
+  ): Promise<Solution> {
     const fullPath = path.resolve(solutionFilePath);
     const listedPaths = parseProjectPaths(await this.listProjects(fullPath));
-    const projects: Project[] = [];
     const unsupportedProjects: string[] = [];
     const loadFailures: ProjectLoadFailure[] = [];
+    const supportedPaths: string[] = [];
 
     for (const listedPath of listedPaths) {
       const projectPath = path.resolve(path.dirname(fullPath), listedPath);
@@ -52,21 +63,75 @@ export default class SolutionLoader {
         unsupportedProjects.push(projectPath);
         continue;
       }
+      supportedPaths.push(projectPath);
+    }
 
+    if (supportedPaths.length === 0) {
+      return {
+        name: path.basename(fullPath, path.extname(fullPath)),
+        fsPath: fullPath,
+        projects: [],
+        unsupportedProjects,
+        loadFailures: [],
+      };
+    }
+
+    if (this.projectLoader.loadSolutionInventoryAsync) {
+      onProgress?.({
+        completed: 0,
+        total: supportedPaths.length,
+        message: `Loading package inventory for ${supportedPaths.length} solution projects...`,
+      });
       try {
-        projects.push(await this.projectLoader.loadProjectAsync(projectPath));
+        const projects = await this.projectLoader.loadSolutionInventoryAsync(fullPath, supportedPaths);
+        onProgress?.({ completed: supportedPaths.length, total: supportedPaths.length });
+        return {
+          name: path.basename(fullPath, path.extname(fullPath)),
+          fsPath: fullPath,
+          projects,
+          unsupportedProjects,
+          loadFailures: [],
+        };
       } catch (error) {
-        loadFailures.push({
-          projectPath,
-          message: errorMessage(error),
+        onProgress?.({
+          completed: 0,
+          total: supportedPaths.length,
+          message: `Solution-wide package listing failed (${errorMessage(error)}); loading projects individually...`,
         });
       }
     }
 
+    const projectsByIndex: Array<Project | undefined> = new Array(supportedPaths.length);
+    onProgress?.({ completed: 0, total: supportedPaths.length });
+    let nextIndex = 0;
+    let completed = 0;
+
+    const loadNextProject = async (): Promise<void> => {
+      while (nextIndex < supportedPaths.length) {
+        const index = nextIndex++;
+        const projectPath = supportedPaths[index];
+        try {
+          projectsByIndex[index] = await this.projectLoader.loadProjectAsync(projectPath);
+        } catch (error) {
+          loadFailures.push({
+            projectPath,
+            message: errorMessage(error),
+          });
+        } finally {
+          completed++;
+          onProgress?.({ completed, total: supportedPaths.length });
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(maxConcurrentProjectLoads, supportedPaths.length) }, () => loadNextProject())
+    );
+
     return {
       name: path.basename(fullPath, path.extname(fullPath)),
       fsPath: fullPath,
-      projects,
+      projects: projectsByIndex.filter((project): project is Project => project !== undefined),
       unsupportedProjects,
       loadFailures,
     };

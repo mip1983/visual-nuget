@@ -24,6 +24,9 @@
   </div>
   <hr />
 }
+@if (contextLoading?.error) {
+  <div class="package-load-error" role="alert">{{ contextLoading.message }}</div>
+}
 @if (packages && packages.length) {
   <section class="package-list">
     @if (showTransitivePackages) {
@@ -78,8 +81,4 @@
 
 @if (loadError) {
   <div class="package-load-error" role="alert">{{ loadError }}</div>
-}
-
-@if (!packages && !loadError) {
-  <app-loading-spinner></app-loading-spinner>
 }

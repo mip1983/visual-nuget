@@ -1,7 +1,168 @@
 import * as path from 'path';
+import * as fs from 'fs/promises';
+import * as os from 'os';
 import ProjectFileLoader from './project-file-loader';
 
 describe('ProjectFileLoader', () => {
+  it('loads resolved project inventory without MSBuild evaluations', async () => {
+    const projectPath = path.resolve('workspace', 'Inventory.csproj');
+    const listPackages = jest.fn().mockResolvedValue(
+      JSON.stringify({
+        version: 1,
+        projects: [
+          {
+            path: projectPath,
+            frameworks: [
+              {
+                framework: 'net8.0',
+                topLevelPackages: [{ id: 'Direct.Package', resolvedVersion: '1.2.3' }],
+                transitivePackages: [{ id: 'Transitive.Package', resolvedVersion: '4.5.6' }],
+              },
+            ],
+          },
+        ],
+      })
+    );
+    const evaluate = jest.fn();
+
+    const project = await new ProjectFileLoader(evaluate, listPackages).loadProjectInventoryAsync(projectPath);
+
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(listPackages).toHaveBeenCalledTimes(1);
+    expect(project).toMatchObject({
+      fsPath: projectPath,
+      targetFrameworks: ['net8.0'],
+      packageMetadataComplete: false,
+      packages: [
+        expect.objectContaining({ id: 'Direct.Package', version: '1.2.3', packageLevel: 'direct' }),
+        expect.objectContaining({ id: 'Transitive.Package', version: '4.5.6', packageLevel: 'transitive' }),
+      ],
+    });
+  });
+
+  it('preserves restored PackageVersion ranges in the fast inventory', async () => {
+    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'visual-nuget-ranges-'));
+    try {
+      const projectPath = path.join(temporaryDirectory, 'Ranges.csproj');
+      await fs.mkdir(path.join(temporaryDirectory, 'obj'), { recursive: true });
+      await fs.writeFile(
+        path.join(temporaryDirectory, 'obj', 'project.assets.json'),
+        JSON.stringify({
+          project: {
+            restore: {
+              projectPath,
+              originalTargetFrameworks: ['net8.0'],
+              centralPackageVersionsManagementEnabled: true,
+            },
+            frameworks: {
+              'net8.0': {
+                targetAlias: 'net8.0',
+                dependencies: {
+                  'Pinned.Package': { target: 'Package', version: '[7.0.0]', versionCentrallyManaged: true },
+                  'Bounded.Package': { target: 'Package', version: '[7.0.0, 8.0.0)', versionCentrallyManaged: true },
+                },
+              },
+            },
+          },
+        })
+      );
+      const listPackages = jest.fn().mockResolvedValue(
+        JSON.stringify({
+          version: 1,
+          projects: [
+            {
+              path: projectPath,
+              frameworks: [
+                {
+                  framework: 'net8.0',
+                  topLevelPackages: [
+                    { id: 'Pinned.Package', resolvedVersion: '7.0.0' },
+                    { id: 'Bounded.Package', resolvedVersion: '7.5.0' },
+                  ],
+                },
+              ],
+            },
+          ],
+        })
+      );
+
+      const project = await new ProjectFileLoader(undefined, listPackages).loadProjectInventoryAsync(projectPath);
+
+      expect(project.packages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'Pinned.Package',
+            version: '7.0.0',
+            targetFrameworkVersions: expect.arrayContaining([expect.objectContaining({ requestedVersion: '[7.0.0]' })]),
+          }),
+          expect.objectContaining({
+            id: 'Bounded.Package',
+            version: '7.5.0',
+            targetFrameworkVersions: expect.arrayContaining([
+              expect.objectContaining({ requestedVersion: '[7.0.0, 8.0.0)' }),
+            ]),
+          }),
+        ])
+      );
+    } finally {
+      await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the initial evaluation for a single target framework', async () => {
+    const projectPath = path.resolve('workspace', 'SingleTarget.csproj');
+    const evaluate = jest.fn().mockResolvedValue({
+      targetFramework: 'net10.0',
+      managePackageVersionsCentrally: false,
+      packageReferences: [],
+      packageVersions: [],
+    });
+    const listPackages = jest.fn().mockResolvedValue(JSON.stringify({ version: 1, projects: [{ path: projectPath, frameworks: [] }] }));
+
+    await new ProjectFileLoader(evaluate, listPackages).loadProjectAsync(projectPath);
+
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(listPackages).toHaveBeenCalledTimes(1);
+  });
+
+  it('evaluates multi-target frameworks concurrently with package listing', async () => {
+    const projectPath = path.resolve('workspace', 'MultiTarget.csproj');
+    let activeEvaluations = 0;
+    let maximumActiveEvaluations = 0;
+    const evaluate = jest.fn(async (_path: string, targetFramework?: string) => {
+      if (!targetFramework) {
+        return {
+          targetFrameworks: 'net8.0;net9.0',
+          managePackageVersionsCentrally: false,
+          packageReferences: [],
+          packageVersions: [],
+        };
+      }
+      activeEvaluations++;
+      maximumActiveEvaluations = Math.max(maximumActiveEvaluations, activeEvaluations);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      activeEvaluations--;
+      return {
+        targetFramework,
+        managePackageVersionsCentrally: false,
+        packageReferences: [],
+        packageVersions: [],
+      };
+    });
+    let packageListingStarted = false;
+    const listPackages = jest.fn(async () => {
+      packageListingStarted = true;
+      return JSON.stringify({ version: 1, projects: [{ path: projectPath, frameworks: [] }] });
+    });
+
+    const project = await new ProjectFileLoader(evaluate, listPackages).loadProjectAsync(projectPath);
+
+    expect(maximumActiveEvaluations).toBe(2);
+    expect(packageListingStarted).toBe(true);
+    expect(project.targetFrameworks).toEqual(['net8.0', 'net9.0']);
+    expect(evaluate).toHaveBeenCalledTimes(3);
+  });
+
   it('loads central versions, overrides, imports, and framework-specific versions from MSBuild evaluation', async () => {
     const projectPath = path.resolve(__dirname, '..', 'test-fixtures', 'cpm', 'CpmApp', 'CpmApp.csproj');
     const listPackages = jest.fn().mockResolvedValue(
@@ -52,8 +213,18 @@ describe('ProjectFileLoader', () => {
           packageLevel: 'direct',
           versionSource: 'central',
           targetFrameworkVersions: expect.arrayContaining([
-            expect.objectContaining({ targetFramework: 'net9.0', version: '10.0.12', versionSource: 'central' }),
-            expect.objectContaining({ targetFramework: 'net10.0', version: '10.0.12', versionSource: 'central' }),
+            expect.objectContaining({
+              targetFramework: 'net9.0',
+              version: '10.0.12',
+              requestedVersion: '10.0.12',
+              versionSource: 'central',
+            }),
+            expect.objectContaining({
+              targetFramework: 'net10.0',
+              version: '10.0.12',
+              requestedVersion: '10.0.12',
+              versionSource: 'central',
+            }),
           ]),
         }),
         expect.objectContaining({

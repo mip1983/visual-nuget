@@ -1,7 +1,7 @@
 import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { Category } from '../../models/category';
 import { PackageRowModel } from '../../models/package-row-model';
-import { PackageManagerService } from '../../services/package-manager.service';
+import { ContextLoadingState, PackageManagerService } from '../../services/package-manager.service';
 import { SelectionService } from '../../services/selection.service';
 
 import { BaseComponent } from '../base-component';
@@ -19,6 +19,7 @@ export class PackageListComponent extends BaseComponent implements OnInit {
 
   public packages: PackageRowModel[] | null = null;
   public loadError: string | null = null;
+  public contextLoading: ContextLoadingState | null = null;
   public isSolution = false;
   public buildAfterRestore = false;
 
@@ -62,6 +63,11 @@ export class PackageListComponent extends BaseComponent implements OnInit {
     this.subscriptions.add(
       this.packageManager.currentPackagesError.subscribe((error) => {
         this.loadError = error;
+      })
+    );
+    this.subscriptions.add(
+      this.packageManager.contextLoading.subscribe((state) => {
+        this.contextLoading = state;
       })
     );
     this.subscriptions.add(

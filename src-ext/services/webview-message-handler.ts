@@ -12,7 +12,7 @@ import {
   UninstallMessage,
   UpdatePackagesMessage,
 } from '../../src-common/models/ui-message';
-import { Project } from '../../src-common/models/project';
+import { Project, Solution } from '../../src-common/models/project';
 import { randomUUID } from 'crypto';
 import { promises as fs } from 'fs';
 import * as path from 'path';
@@ -33,6 +33,12 @@ interface RollbackSnapshot {
   expected: Map<string, Buffer>;
 }
 
+const maxConcurrentMetadataLoads = 2;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default class WebviewMessageHandler {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly projectFileLoader: ProjectFileLoader;
@@ -40,7 +46,9 @@ export default class WebviewMessageHandler {
   private readonly taskManager: TaskManager;
   private readonly taskName = 'visual-nuget';
   private solutionProjects = new Map<string, Project>();
+  private loadedSolution: Solution | undefined;
   private readonly rollbackSnapshots = new Map<string, RollbackSnapshot>();
+  private contextLoadSequence = 0;
 
   public constructor(
     private readonly webview: vscode.Webview,
@@ -102,31 +110,64 @@ export default class WebviewMessageHandler {
   }
 
   private async addPackage(message: InstallMessage): Promise<void> {
-    const args = [
-      'add',
-      { value: message.projectName, quoting: vscode.ShellQuoting.Strong },
-      'package',
-      message.packageId,
-      '-v',
-      message.packageVersion,
-      '-s',
-      message.packageSourceUrl,
-    ];
-
-    const task = this.createDotnetTask('add', args);
     try {
+      const project = await this.loadOperationProject(message.projectName, message.operationId);
+      if (!project) {
+        throw new Error(`Project "${message.projectName}" is no longer available.`);
+      }
+      const args = project.managePackageVersionsCentrally
+        ? [
+            'package',
+            'add',
+            message.packageId,
+            '--version',
+            message.packageVersion,
+            '--project',
+            { value: project.fsPath, quoting: vscode.ShellQuoting.Strong },
+            ...(message.packageSourceUrl ? ['--source', message.packageSourceUrl] : []),
+          ]
+        : [
+            'add',
+            { value: project.fsPath, quoting: vscode.ShellQuoting.Strong },
+            'package',
+            message.packageId,
+            '-v',
+            message.packageVersion,
+            '-s',
+            message.packageSourceUrl,
+          ];
+      const task = this.createDotnetTask('add', args);
       const result = await this.taskManager.executeTask(task);
       const succeeded = result.exitCode === 0;
+      this.postOperationResults(
+        [
+          {
+            projectPath: project.fsPath,
+            packageId: message.packageId,
+            operation: 'add',
+            succeeded,
+            fromVersion: this.getInstalledPackageVersion(project.fsPath, message.packageId),
+            toVersion: message.packageVersion,
+            message:
+              result.error ??
+              (succeeded
+                ? undefined
+                : `${project.managePackageVersionsCentrally ? 'dotnet package add' : 'dotnet add package'} exited with code ${String(result.exitCode)}.`),
+          },
+        ],
+        undefined,
+        false
+      );
+    } catch (error) {
       this.postOperationResults(
         [
           {
             projectPath: message.projectName,
             packageId: message.packageId,
             operation: 'add',
-            succeeded,
-            fromVersion: this.getInstalledPackageVersion(message.projectName, message.packageId),
+            succeeded: false,
             toVersion: message.packageVersion,
-            message: result.error ?? (succeeded ? undefined : `dotnet add package exited with code ${String(result.exitCode)}.`),
+            message: errorMessage(error),
           },
         ],
         undefined,
@@ -138,22 +179,47 @@ export default class WebviewMessageHandler {
   }
 
   private async removePackage(message: UninstallMessage): Promise<void> {
-    const args = ['remove', { value: message.projectName, quoting: vscode.ShellQuoting.Strong }, 'package', message.packageId];
-
-    const task = this.createDotnetTask('remove', args);
     try {
+      const project = await this.loadOperationProject(message.projectName, message.operationId);
+      if (!project) {
+        throw new Error(`Project "${message.projectName}" is no longer available.`);
+      }
+      const args = project.managePackageVersionsCentrally
+        ? [
+            'package',
+            'remove',
+            message.packageId,
+            '--project',
+            { value: project.fsPath, quoting: vscode.ShellQuoting.Strong },
+          ]
+        : ['remove', { value: project.fsPath, quoting: vscode.ShellQuoting.Strong }, 'package', message.packageId];
+      const task = this.createDotnetTask('remove', args);
       const result = await this.taskManager.executeTask(task);
       const succeeded = result.exitCode === 0;
+      this.postOperationResults(
+        [
+          {
+            projectPath: project.fsPath,
+            packageId: message.packageId,
+            operation: 'remove',
+            succeeded,
+            fromVersion: this.getInstalledPackageVersion(project.fsPath, message.packageId),
+            message:
+              result.error ?? (succeeded ? undefined : `dotnet remove package exited with code ${String(result.exitCode)}.`),
+          },
+        ],
+        undefined,
+        false
+      );
+    } catch (error) {
       this.postOperationResults(
         [
           {
             projectPath: message.projectName,
             packageId: message.packageId,
             operation: 'remove',
-            succeeded,
-            fromVersion: this.getInstalledPackageVersion(message.projectName, message.packageId),
-            message:
-              result.error ?? (succeeded ? undefined : `dotnet remove package exited with code ${String(result.exitCode)}.`),
+            succeeded: false,
+            message: errorMessage(error),
           },
         ],
         undefined,
@@ -165,8 +231,9 @@ export default class WebviewMessageHandler {
   }
 
   private async addPackageToProjects(message: InstallPackageInProjectsMessage): Promise<void> {
+    const projectPaths = this.context.type === 'solution' ? message.projectPaths : [this.context.filePath];
     try {
-      const projectPaths = this.context.type === 'solution' ? message.projectPaths : [this.context.filePath];
+      await this.loadOperationProjects(projectPaths, message.operationId);
       const results = await Promise.all(
         projectPaths.map(async (projectPath) => {
           const project = this.findProject(projectPath);
@@ -228,6 +295,19 @@ export default class WebviewMessageHandler {
         })
       );
       this.postOperationResults(results, undefined, false);
+    } catch (error) {
+      this.postOperationResults(
+        projectPaths.map((projectPath) => ({
+          projectPath,
+          packageId: message.packageId,
+          operation: 'add' as const,
+          succeeded: false,
+          toVersion: message.packageVersion,
+          message: errorMessage(error),
+        })),
+        undefined,
+        false
+      );
     } finally {
       this.postOperationCompleted(message.operationId);
     }
@@ -241,6 +321,7 @@ export default class WebviewMessageHandler {
     let rollbackId: string | undefined;
 
     try {
+      await this.loadOperationProjects(message.updates.flatMap((update) => update.projectPaths), message.operationId);
       const targets = this.resolveUpdateTargets(message.updates, results);
       if (targets.length > 0) {
         const affectedFiles = this.getAffectedPackageFiles(targets);
@@ -523,6 +604,70 @@ export default class WebviewMessageHandler {
     return Array.from(this.solutionProjects.values()).find((project) => path.resolve(project.fsPath).toLowerCase() === normalizedPath);
   }
 
+  private async loadOperationProject(
+    projectPath: string,
+    operationId?: string,
+    refreshContext = true
+  ): Promise<Project | undefined> {
+    const project = this.findProject(projectPath);
+    if (!project || project.packageMetadataComplete !== false) {
+      return project;
+    }
+    this.postOperationProgress(operationId, `Loading package metadata for ${project.name}...`);
+    const projectWithMetadata = await this.projectFileLoader.loadProjectAsync(project.fsPath);
+    this.solutionProjects.set(project.fsPath, projectWithMetadata);
+    if (refreshContext) {
+      this.postLoadedContext();
+    }
+    return projectWithMetadata;
+  }
+
+  private async loadOperationProjects(projectPaths: string[], operationId?: string): Promise<void> {
+    const uniquePaths = Array.from(
+      new Map(projectPaths.map((projectPath) => [path.resolve(projectPath).toLowerCase(), projectPath])).values()
+    );
+    const metadataNeeded = uniquePaths.some((projectPath) => this.findProject(projectPath)?.packageMetadataComplete === false);
+    let nextIndex = 0;
+    const failures: string[] = [];
+    const loadNext = async (): Promise<void> => {
+      while (nextIndex < uniquePaths.length) {
+        const projectPath = uniquePaths[nextIndex++];
+        try {
+          await this.loadOperationProject(projectPath, operationId, false);
+        } catch (error) {
+          failures.push(`${projectPath}: ${errorMessage(error)}`);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(maxConcurrentMetadataLoads, uniquePaths.length) }, () => loadNext())
+    );
+    if (failures.length > 0) {
+      throw new Error(`Could not load project metadata required for this operation: ${failures.join('; ')}`);
+    }
+    if (metadataNeeded) {
+      this.postLoadedContext();
+    }
+  }
+
+  private postLoadedContext(): void {
+    if (this.context.type === 'project') {
+      const project = this.findProject(this.context.filePath);
+      if (project) {
+        this.webview.postMessage({ type: 'project', data: project });
+      }
+      return;
+    }
+    if (!this.loadedSolution) {
+      return;
+    }
+    this.loadedSolution = {
+      ...this.loadedSolution,
+      projects: this.loadedSolution.projects.map((project) => this.findProject(project.fsPath) ?? project),
+    };
+    this.webview.postMessage({ type: 'solution', data: this.loadedSolution });
+  }
+
   private getInstalledPackageVersion(projectPath: string, packageId: string): string | undefined {
     return this.findProject(projectPath)?.packages.find((item) => item.id.toLowerCase() === packageId.toLowerCase())?.version;
   }
@@ -632,6 +777,7 @@ export default class WebviewMessageHandler {
 
   private async removePackageFromProjects(message: RemovePackageFromProjectsMessage): Promise<void> {
     try {
+      await this.loadOperationProjects(message.projectPaths, message.operationId);
       const results = await Promise.all(
         message.projectPaths.map((projectPath) => {
           const project = this.findProject(projectPath);
@@ -665,6 +811,18 @@ export default class WebviewMessageHandler {
         })
       );
       this.postOperationResults(results, undefined, false);
+    } catch (error) {
+      this.postOperationResults(
+        message.projectPaths.map((projectPath) => ({
+          projectPath,
+          packageId: message.packageId,
+          operation: 'remove' as const,
+          succeeded: false,
+          message: errorMessage(error),
+        })),
+        undefined,
+        false
+      );
     } finally {
       this.postOperationCompleted(message.operationId);
     }
@@ -714,34 +872,94 @@ export default class WebviewMessageHandler {
   }
 
   private loadContext(): void {
+    const requestId = ++this.contextLoadSequence;
+    this.postContextLoading('Loading project and package references...');
     if (this.context.type === 'solution') {
-      this.loadSolution({ command: 'load-solution', solutionFilePath: this.context.filePath });
+      this.loadSolution({ command: 'load-solution', solutionFilePath: this.context.filePath }, requestId);
       return;
     }
 
-    this.projectFileLoader.loadProjectAsync(this.context.filePath).then(
+    this.postContextLoading('Loading project package references...');
+    void this.loadProjectInventory().then(
       (project) => {
+        if (requestId !== this.contextLoadSequence) {
+          return;
+        }
         this.solutionProjects = new Map([[project.fsPath, project]]);
+        this.loadedSolution = undefined;
         const message: ExtensionMessage = { type: 'project', data: project };
         this.webview.postMessage(message);
       },
       (error: unknown) => {
-        vscode.window.showErrorMessage(`Error loading project: ${error instanceof Error ? error.message : String(error)}`);
+        if (requestId !== this.contextLoadSequence) {
+          return;
+        }
+        this.postContextLoadError(error);
       }
     );
   }
 
-  private loadSolution(message: LoadSolutionMessage): void {
-    this.solutionLoader.loadSolutionAsync(message.solutionFilePath).then(
+  private async loadProjectInventory(): Promise<Project> {
+    try {
+      return await this.projectFileLoader.loadProjectInventoryAsync(this.context.filePath);
+    } catch (inventoryError) {
+      this.postContextLoading(
+        `Fast package listing failed (${errorMessage(inventoryError)}); loading project metadata...`
+      );
+      try {
+        return await this.projectFileLoader.loadProjectAsync(this.context.filePath);
+      } catch (metadataError) {
+        const inventoryMessage = inventoryError instanceof Error ? inventoryError.message : String(inventoryError);
+        const metadataMessage = metadataError instanceof Error ? metadataError.message : String(metadataError);
+        throw new Error(`Package inventory failed (${inventoryMessage}); detailed project loading also failed (${metadataMessage}).`);
+      }
+    }
+  }
+
+  private loadSolution(message: LoadSolutionMessage, requestId = ++this.contextLoadSequence): void {
+    this.postContextLoading('Finding projects in solution...');
+    void this.solutionLoader.loadSolutionAsync(message.solutionFilePath, ({ completed, total, message: progressMessage }) => {
+      if (requestId === this.contextLoadSequence) {
+        this.postContextLoading(
+          progressMessage ?? `Loading solution projects (${completed} of ${total})...`,
+          completed,
+          total
+        );
+      }
+    }).then(
       (solution) => {
+        if (requestId !== this.contextLoadSequence) {
+          return;
+        }
+        this.loadedSolution = solution;
         this.solutionProjects = new Map(solution.projects.map((project) => [project.fsPath, project]));
         const extensionMessage: ExtensionMessage = { type: 'solution', data: solution };
         this.webview.postMessage(extensionMessage);
       },
       (error: unknown) => {
-        vscode.window.showErrorMessage(`Error loading solution: ${error instanceof Error ? error.message : String(error)}`);
+        if (requestId === this.contextLoadSequence) {
+          this.postContextLoadError(error);
+        }
       }
     );
+  }
+
+  private postContextLoading(message: string, completed?: number, total?: number): void {
+    const extensionMessage: ExtensionMessage = {
+      type: 'context-loading',
+      data: { message, completed, total },
+    };
+    this.webview.postMessage(extensionMessage);
+  }
+
+  private postContextLoadError(error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error);
+    const extensionMessage: ExtensionMessage = {
+      type: 'context-load-error',
+      data: { message: detail },
+    };
+    this.webview.postMessage(extensionMessage);
+    vscode.window.showErrorMessage(`Error loading ${this.context.type}: ${detail}`);
   }
 
   private loadConfiguration(): void {

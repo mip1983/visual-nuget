@@ -1,4 +1,5 @@
 import * as path from 'path';
+import * as fs from 'fs/promises';
 import { InstalledPackage, PackageLevel, PackageVersionSource, Project, TargetFrameworkPackageVersion } from '../../src-common/models/project';
 import { executeDotnet } from './dotnet-cli';
 
@@ -21,13 +22,50 @@ export interface ProjectEvaluation {
 export type ProjectEvaluationRunner = (projectFilePath: string, targetFramework?: string) => Promise<ProjectEvaluation>;
 
 interface PackageListEntry {
+  projectPath: string;
   id: string;
   targetFramework: string;
   version: string;
   packageLevel: 'direct' | 'transitive';
 }
 
+interface PackageListProject {
+  path: string;
+  frameworks: Array<{
+    framework: string;
+    topLevelPackages?: Array<{ id: string; resolvedVersion?: string }>;
+    transitivePackages?: Array<{ id: string; resolvedVersion?: string }>;
+  }>;
+}
+
+interface PackageListDocument {
+  projects: PackageListProject[];
+}
+
+interface AssetsDependency {
+  version?: string;
+  versionCentrallyManaged?: boolean;
+  versionOverride?: string;
+}
+
+interface AssetsFramework {
+  targetAlias?: string;
+  dependencies?: Record<string, AssetsDependency>;
+}
+
+interface ProjectAssets {
+  project?: {
+    restore?: {
+      projectPath?: string;
+      originalTargetFrameworks?: string[];
+      centralPackageVersionsManagementEnabled?: boolean;
+    };
+    frameworks?: Record<string, AssetsFramework>;
+  };
+}
+
 export type ProjectPackageLister = (projectFilePath: string) => Promise<string>;
+export type SolutionPackageLister = (solutionFilePath: string) => Promise<string>;
 
 interface EvaluationJson {
   Properties?: Record<string, unknown>;
@@ -73,50 +111,32 @@ function runPackageList(projectFilePath: string): Promise<string> {
   );
 }
 
-function parsePackageList(output: string): PackageListEntry[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(output) as unknown;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Could not parse dotnet package list output: ${detail}`);
-  }
+function runSolutionPackageList(solutionFilePath: string): Promise<string> {
+  return executeDotnet(
+    ['list', solutionFilePath, 'package', '--include-transitive', '--format', 'json', '--no-restore'],
+    path.dirname(solutionFilePath),
+    `Package listing for solution "${solutionFilePath}"`
+  );
+}
 
-  if (!isRecord(parsed) || !Array.isArray(parsed['projects'])) {
-    throw new Error('dotnet package list returned an invalid project list.');
-  }
-
+function packageEntriesFromDocument(document: PackageListDocument): PackageListEntry[] {
   const entries: PackageListEntry[] = [];
-  for (const project of parsed['projects']) {
-    if (!isRecord(project) || !Array.isArray(project['frameworks'])) {
-      throw new Error('dotnet package list returned an invalid framework list.');
-    }
-    for (const framework of project['frameworks']) {
-      if (!isRecord(framework) || typeof framework['framework'] !== 'string') {
-        throw new Error('dotnet package list returned an invalid framework entry.');
-      }
+  for (const project of document.projects) {
+    for (const framework of project.frameworks) {
       for (const [key, packageLevel] of [
         ['topLevelPackages', 'direct'],
         ['transitivePackages', 'transitive'],
       ] as const) {
-        const packages = framework[key];
-        if (packages === undefined) {
-          continue;
-        }
-        if (!Array.isArray(packages)) {
-          throw new Error(`dotnet package list returned an invalid ${key} list.`);
-        }
-        for (const packageItem of packages) {
-          if (!isRecord(packageItem) || typeof packageItem['id'] !== 'string') {
-            throw new Error(`dotnet package list returned an invalid ${key} entry.`);
-          }
-          const version = readString(packageItem['resolvedVersion']);
+        const packages = key === 'topLevelPackages' ? framework.topLevelPackages : framework.transitivePackages;
+        for (const packageItem of packages ?? []) {
+          const version = packageItem.resolvedVersion;
           if (!version) {
             continue;
           }
           entries.push({
-            id: packageItem['id'],
-            targetFramework: framework['framework'],
+            projectPath: project.path,
+            id: packageItem.id,
+            targetFramework: framework.framework,
             version,
             packageLevel,
           });
@@ -125,6 +145,190 @@ function parsePackageList(output: string): PackageListEntry[] {
     }
   }
   return entries;
+}
+
+function parsePackageListDocument(output: string): PackageListDocument {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not parse dotnet package list output: ${detail}`);
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed['projects'])) {
+    throw new Error('dotnet package list returned an invalid project list.');
+  }
+
+  const projects: PackageListProject[] = [];
+  for (const project of parsed['projects']) {
+    if (!isRecord(project) || typeof project['path'] !== 'string' || !Array.isArray(project['frameworks'])) {
+      throw new Error('dotnet package list returned an invalid project entry.');
+    }
+    const frameworks: PackageListProject['frameworks'] = [];
+    for (const framework of project['frameworks']) {
+      if (!isRecord(framework) || typeof framework['framework'] !== 'string') {
+        throw new Error('dotnet package list returned an invalid framework entry.');
+      }
+      frameworks.push({
+        framework: framework['framework'],
+        topLevelPackages: readPackageListItems(framework['topLevelPackages'], 'topLevelPackages'),
+        transitivePackages: readPackageListItems(framework['transitivePackages'], 'transitivePackages'),
+      });
+    }
+    projects.push({ path: project['path'], frameworks });
+  }
+  return { projects };
+}
+
+function readPackageListItems(value: unknown, property: string): Array<{ id: string; resolvedVersion?: string }> {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`dotnet package list returned an invalid ${property} list.`);
+  }
+  return value.map((item: unknown) => {
+    if (!isRecord(item) || typeof item['id'] !== 'string') {
+      throw new Error(`dotnet package list returned an invalid ${property} entry.`);
+    }
+    return {
+      id: item['id'],
+      resolvedVersion: readString(item['resolvedVersion']),
+    };
+  });
+}
+
+function normalizeProjectPath(projectPath: string): string {
+  return path.resolve(projectPath).toLowerCase();
+}
+
+async function readProjectAssets(projectFilePath: string): Promise<ProjectAssets | undefined> {
+  const assetsPath = path.join(path.dirname(projectFilePath), 'obj', 'project.assets.json');
+  let contents: string;
+  try {
+    contents = await fs.readFile(assetsPath, 'utf8');
+  } catch (error) {
+    if (isRecord(error) && error['code'] === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(contents) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not parse project assets at "${assetsPath}": ${detail}`);
+  }
+  if (!isRecord(parsed) || !isRecord(parsed['project'])) {
+    return undefined;
+  }
+  const project = parsed['project'];
+  const restore = isRecord(project['restore']) ? project['restore'] : undefined;
+  const restoredProjectPath = readString(restore?.['projectPath']);
+  if (restoredProjectPath && normalizeProjectPath(restoredProjectPath) !== normalizeProjectPath(projectFilePath)) {
+    return undefined;
+  }
+  const frameworks = isRecord(project['frameworks']) ? project['frameworks'] : undefined;
+  return {
+    project: {
+      restore: {
+        projectPath: restoredProjectPath,
+        originalTargetFrameworks: Array.isArray(restore?.['originalTargetFrameworks'])
+          ? restore?.['originalTargetFrameworks'].filter((item): item is string => typeof item === 'string')
+          : undefined,
+        centralPackageVersionsManagementEnabled:
+          typeof restore?.['centralPackageVersionsManagementEnabled'] === 'boolean'
+            ? restore['centralPackageVersionsManagementEnabled']
+            : undefined,
+      },
+      frameworks: frameworks as Record<string, AssetsFramework> | undefined,
+    },
+  };
+}
+
+function applyAssetsMetadata(project: Project, assets: ProjectAssets | undefined): void {
+  const assetsProject = assets?.project;
+  project.packageMetadataComplete = false;
+  if (!assetsProject) {
+    return;
+  }
+  project.managePackageVersionsCentrally = assetsProject.restore?.centralPackageVersionsManagementEnabled;
+  if (assetsProject.restore?.originalTargetFrameworks?.length) {
+    project.targetFrameworks = assetsProject.restore.originalTargetFrameworks;
+  }
+
+  const dependencies = new Map<string, AssetsDependency>();
+  Object.entries(assetsProject.frameworks ?? {}).forEach(([framework, value]) => {
+    if (!isRecord(value)) {
+      return;
+    }
+    const targetAlias = readString(value['targetAlias']) ?? framework;
+    const frameworkDependencies = isRecord(value['dependencies']) ? value['dependencies'] : {};
+    Object.entries(frameworkDependencies).forEach(([packageId, value]) => {
+      if (!isRecord(value)) {
+        return;
+      }
+      dependencies.set(`${targetAlias.toLowerCase()}|${packageId.toLowerCase()}`, {
+        version: readString(value['version']),
+        versionCentrallyManaged: typeof value['versionCentrallyManaged'] === 'boolean' ? value['versionCentrallyManaged'] : undefined,
+        versionOverride: readString(value['versionOverride']),
+      });
+    });
+  });
+
+  project.packages.forEach((installedPackage) => {
+    const sources = new Set<PackageVersionSource>();
+    installedPackage.targetFrameworkVersions?.forEach((frameworkVersion) => {
+      if (frameworkVersion.packageLevel !== 'direct') {
+        return;
+      }
+      const dependency = dependencies.get(
+        `${frameworkVersion.targetFramework.toLowerCase()}|${installedPackage.id.toLowerCase()}`
+      );
+      if (!dependency) {
+        return;
+      }
+      frameworkVersion.requestedVersion = dependency.versionOverride ?? dependency.version;
+      frameworkVersion.versionSource = dependency.versionOverride
+        ? 'override'
+        : dependency.versionCentrallyManaged
+          ? 'central'
+          : 'project';
+      sources.add(frameworkVersion.versionSource);
+    });
+    if (sources.size > 0) {
+      installedPackage.versionSource = sources.size === 1 ? Array.from(sources)[0] : 'mixed';
+    }
+  });
+}
+
+function createInventoryProject(projectFilePath: string, entries: PackageListEntry[], assets: ProjectAssets | undefined): Project {
+  const packages = mergeResolvedPackages([], entries);
+  const targetFrameworks = Array.from(new Set(entries.map((entry) => entry.targetFramework)));
+  const project: Project = {
+    name: path.basename(projectFilePath),
+    fsPath: path.resolve(projectFilePath),
+    packages,
+    targetFrameworks,
+    packageMetadataComplete: false,
+  };
+  applyAssetsMetadata(project, assets);
+  return project;
+}
+
+async function loadInventoryProject(projectFilePath: string, entries: PackageListEntry[]): Promise<Project> {
+  let assets: ProjectAssets | undefined;
+  let assetsWarning: string | undefined;
+  try {
+    assets = await readProjectAssets(projectFilePath);
+  } catch (error) {
+    assetsWarning = error instanceof Error ? error.message : String(error);
+  }
+  const project = createInventoryProject(projectFilePath, entries, assets);
+  project.packageListWarning = assetsWarning;
+  return project;
 }
 
 function runMsbuildEvaluation(projectFilePath: string, targetFramework?: string): Promise<ProjectEvaluation> {
@@ -195,6 +399,7 @@ function effectivePackageVersion(
   return {
     targetFramework: '',
     version,
+    requestedVersion: version || undefined,
     versionSource,
     packageLevel: 'direct',
     condition: centralVersion?.condition ?? reference.condition,
@@ -315,8 +520,46 @@ function mergeResolvedPackages(packages: InstalledPackage[], entries: PackageLis
 export default class ProjectFileLoader {
   public constructor(
     private readonly evaluate: ProjectEvaluationRunner = runMsbuildEvaluation,
-    private readonly listPackages: ProjectPackageLister = runPackageList
+    private readonly listPackages: ProjectPackageLister = runPackageList,
+    private readonly listSolutionPackages: SolutionPackageLister = runSolutionPackageList
   ) {}
+
+  public async loadProjectInventoryAsync(projectFilePath: string): Promise<Project> {
+    const fullPath = path.resolve(projectFilePath);
+    const output = await this.listPackages(fullPath);
+    const document = parsePackageListDocument(output);
+    if (!document.projects.some((project) => normalizeProjectPath(project.path) === normalizeProjectPath(fullPath))) {
+      throw new Error(`dotnet package list did not return project "${fullPath}".`);
+    }
+    const entries = packageEntriesFromDocument(document).filter(
+      (entry) => normalizeProjectPath(entry.projectPath) === normalizeProjectPath(fullPath)
+    );
+    return loadInventoryProject(fullPath, entries);
+  }
+
+  public async loadSolutionInventoryAsync(solutionFilePath: string, projectFilePaths: string[]): Promise<Project[]> {
+    const fullPath = path.resolve(solutionFilePath);
+    const output = await this.listSolutionPackages(fullPath);
+    const document = parsePackageListDocument(output);
+    const projectPaths = new Set(document.projects.map((project) => normalizeProjectPath(project.path)));
+    const missingProjects = projectFilePaths.filter((projectPath) => !projectPaths.has(normalizeProjectPath(projectPath)));
+    if (missingProjects.length > 0) {
+      throw new Error(`dotnet package list did not return ${missingProjects.length} solution project(s): ${missingProjects.join(', ')}`);
+    }
+
+    const entriesByProject = new Map<string, PackageListEntry[]>();
+    packageEntriesFromDocument(document).forEach((entry) => {
+      const key = normalizeProjectPath(entry.projectPath);
+      const projectEntries = entriesByProject.get(key) ?? [];
+      projectEntries.push(entry);
+      entriesByProject.set(key, projectEntries);
+    });
+    return Promise.all(
+      projectFilePaths.map((projectPath) =>
+        loadInventoryProject(projectPath, entriesByProject.get(normalizeProjectPath(projectPath)) ?? [])
+      )
+    );
+  }
 
   public async loadProjectAsync(projectFilePath: string): Promise<Project> {
     const fullPath = path.resolve(projectFilePath);
@@ -326,19 +569,26 @@ export default class ProjectFileLoader {
       .map((framework) => framework.trim())
       .filter((framework) => framework.length > 0);
 
-    const evaluations: ProjectEvaluation[] = [];
-    if (targetFrameworks.length > 0) {
-      for (const targetFramework of targetFrameworks) {
-        evaluations.push(await this.evaluate(fullPath, targetFramework));
-      }
-    } else {
-      evaluations.push(initialEvaluation);
-    }
+    const initialEvaluationCoversTargetFramework =
+      targetFrameworks.length === 1 &&
+      initialEvaluation.targetFramework?.toLowerCase() === targetFrameworks[0].toLowerCase();
+    const evaluationsPromise =
+      targetFrameworks.length === 0 || initialEvaluationCoversTargetFramework
+        ? Promise.resolve([initialEvaluation])
+        : Promise.all(targetFrameworks.map((targetFramework) => this.evaluate(fullPath, targetFramework)));
+    const packageListPromise = this.listPackages(fullPath).then(
+      (output) => ({ output }),
+      (error: unknown) => ({ error })
+    );
+    const [evaluations, packageListResult] = await Promise.all([evaluationsPromise, packageListPromise]);
 
     let packages = mergePackages(evaluations);
     let packageListWarning: string | undefined;
     try {
-      const packageList = parsePackageList(await this.listPackages(fullPath));
+      if ('error' in packageListResult) {
+        throw packageListResult.error;
+      }
+      const packageList = packageEntriesFromDocument(parsePackageListDocument(packageListResult.output));
       validateDirectPackageListing(evaluations, packageList);
       packages = mergeResolvedPackages(packages, packageList);
     } catch (error) {
@@ -351,6 +601,7 @@ export default class ProjectFileLoader {
       packages,
       targetFrameworks,
       managePackageVersionsCentrally: initialEvaluation.managePackageVersionsCentrally,
+      packageMetadataComplete: true,
       packageListWarning,
     };
   }

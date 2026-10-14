@@ -12,6 +12,7 @@ describe('VersionService', () => {
   let service: VersionService;
   const mockRcompare = rcompare as jest.MockedFunction<typeof rcompare>;
   const mockCoerce = coerce as jest.MockedFunction<typeof coerce>;
+  const realSemver = jest.requireActual<typeof import('semver')>('semver');
 
   beforeEach(() => {
     TestBed.configureTestingModule({});
@@ -94,5 +95,26 @@ describe('VersionService', () => {
     expect(mockCoerce).toHaveBeenCalledWith('invalid.version');
     expect(mockCoerce).toHaveBeenCalledWith('another.invalid.version');
     expect(result).toBe(0);
+  });
+
+  test.each<[string, string, boolean]>([
+    ['7.0.0', '[7.0.0]', true],
+    ['7.0.1', '[7.0.0]', false],
+    ['8.0.0', '7.0.0', true],
+    ['6.9.9', '7.0.0', false],
+    ['7.0.0', '[7.0.0, 8.0.0)', true],
+    ['7.9.9', '[7.0.0, 8.0.0)', true],
+    ['8.0.0', '[7.0.0, 8.0.0)', false],
+    ['8.0.0', '(, 8.0.0]', true],
+    ['8.0.1', '(, 8.0.0]', false],
+    ['7.9.0', '7.*', true],
+    ['8.0.0', '7.*', false],
+    ['7.9.0-beta.1', '7.*', false],
+    ['7.9.0-beta.1', '7.*-*', true],
+  ])('should evaluate NuGet version range %s against %s', (version, range, expected) => {
+    mockRcompare.mockImplementation(realSemver.rcompare);
+    mockCoerce.mockImplementation(realSemver.coerce);
+
+    expect(service.satisfiesVersionRange(version, range)).toBe(expected);
   });
 });

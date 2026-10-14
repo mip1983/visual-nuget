@@ -2,7 +2,7 @@
   <section class="toolbar" aria-label="main toolbar" [formGroup]="searchForm">
     <div class="toolbar-start">
       <input type="search" class="search-box" placeholder="Search" formControlName="query" />
-      <button type="button" class="button secondary" (click)="refresh()">
+      <button type="button" class="button secondary" (click)="refresh(true, true)">
         <fa-icon icon="redo-alt"></fa-icon>
       </button>
       <span class="prerelease-checkbox">

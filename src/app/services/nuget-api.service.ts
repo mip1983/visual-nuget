@@ -1,6 +1,6 @@
 import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { Injectable } from '@angular/core';
-import { catchError, forkJoin, map, Observable, of, switchMap, throwError } from 'rxjs';
+import { catchError, from, map, mergeMap, Observable, of, shareReplay, switchMap, throwError, toArray } from 'rxjs';
 import { prerelease } from 'semver';
 
 import { PackageSource } from '../../../src-common/models/package-source';
@@ -14,6 +14,12 @@ import { VersionService } from './version.service';
   providedIn: 'root',
 })
 export class NuGetApiService {
+  private readonly metadataRequestConcurrency = 8;
+  private readonly serviceIndexCache = new Map<string, Observable<ApiIndexResponse>>();
+  private readonly packageSearchCache = new Map<string, Observable<PackageRowModel[]>>();
+  private readonly packageSummaryCache = new Map<string, Observable<PackageRowModel | null>>();
+  private readonly packageHistoryCache = new Map<string, Observable<PackageRowModel | null>>();
+
   private readonly VERSIONED: string = 'Versioned';
   private readonly VERSION360: string = '3.6.0';
   private readonly VERSION350: string = '3.5.0';
@@ -36,39 +42,228 @@ export class NuGetApiService {
 
   constructor(private http: HttpClient, private versionService: VersionService) {}
 
+  public clearPackageCache(source: PackageSource): void {
+    const sourceCachePrefix = `${JSON.stringify([source.url, source.authorizationHeader ?? '']).slice(0, -1)},`;
+    [this.packageSearchCache, this.packageSummaryCache, this.packageHistoryCache].forEach((cache) => {
+      Array.from(cache.keys())
+        .filter((cacheKey) => cacheKey.startsWith(sourceCachePrefix))
+        .forEach((cacheKey) => cache.delete(cacheKey));
+    });
+  }
+
   public search(query: string, prerelease: boolean, source: PackageSource): Observable<PackageRowModel[]> {
+    const cacheKey = JSON.stringify([source.url, source.authorizationHeader ?? '', query, prerelease]);
+    const cachedSearch = this.packageSearchCache.get(cacheKey);
+    if (cachedSearch) {
+      return cachedSearch;
+    }
+
     const requestHeaders = this.composeRequestHeaders(source.authorizationHeader);
 
-    return this.getApiUrl(source.url, requestHeaders, this.searchQueryServiceEndpoints).pipe(
+    const searchRequest = this.getApiUrl(source.url, requestHeaders, this.searchQueryServiceEndpoints).pipe(
       switchMap((searchApiUrl: string) => {
         return this.executeSearch(query, prerelease, searchApiUrl, requestHeaders);
       }),
       map((results: SearchResults) => {
         return this.mapSearchResultsToPackageRows(results.data, source.url);
-      })
+      }),
+      catchError((error: unknown) => {
+        this.packageSearchCache.delete(cacheKey);
+        return throwError(() => error);
+      }),
+      shareReplay({ bufferSize: 1, refCount: false })
     );
+    this.packageSearchCache.set(cacheKey, searchRequest);
+    return searchRequest;
   }
 
-  public searchByPackageIds(packageIds: string[], query: string, prerelease: boolean, source: PackageSource): Observable<PackageRowModel[]> {
+  public searchByPackageIds(
+    packageIds: string[],
+    query: string,
+    prerelease: boolean,
+    source: PackageSource,
+    includeVersions = true
+  ): Observable<PackageRowModel[]> {
     if (packageIds.length === 0) {
       return of([]);
+    }
+
+    const uniquePackageIds = Array.from(new Map(packageIds.map((packageId) => [packageId.toLowerCase(), packageId])).values());
+    if (!includeVersions) {
+      return this.searchPackageSummaries(uniquePackageIds, query, prerelease, source);
     }
 
     const requestHeaders = this.composeRequestHeaders(source.authorizationHeader);
 
     return this.getApiUrl(source.url, requestHeaders, this.registrationsBaseUrlEndpoints).pipe(
-      switchMap((metaApiUrl: string) => {
-        return this.executeMetadataGets(packageIds, query, prerelease, metaApiUrl, requestHeaders, source.url);
-      })
+      switchMap((metaApiUrl: string) =>
+        from(uniquePackageIds).pipe(
+          mergeMap(
+            (packageId) => this.getPackageHistory(packageId, prerelease, source, metaApiUrl, requestHeaders),
+            this.metadataRequestConcurrency
+          ),
+          toArray(),
+          map((results) => this.filterAndSortPackageRowResults(results, query))
+        )
+      )
     );
   }
 
-  private executeSearch(query: string, prerelease: boolean, searchApiUrl: string, authHeaders: HttpHeaders): Observable<SearchResults> {
-    const searchParams = {
+  private searchPackageSummaries(
+    packageIds: string[],
+    query: string,
+    prerelease: boolean,
+    source: PackageSource
+  ): Observable<PackageRowModel[]> {
+    return from(packageIds).pipe(
+      mergeMap((packageId) => this.getPackageSummary(packageId, prerelease, source), this.metadataRequestConcurrency),
+      toArray(),
+      map((results) => this.filterAndSortPackageRowResults(results, query))
+    );
+  }
+
+  private getPackageSummary(packageId: string, includePrerelease: boolean, source: PackageSource): Observable<PackageRowModel | null> {
+    const cacheKey = JSON.stringify([
+      source.url,
+      source.authorizationHeader ?? '',
+      packageId.toLowerCase(),
+      includePrerelease,
+    ]);
+    const cachedSummary = this.packageSummaryCache.get(cacheKey);
+    if (cachedSummary) {
+      return cachedSummary;
+    }
+
+    let searchEndpointAvailable = true;
+    const summaryRequest = this.searchSinglePackageSummary(packageId, includePrerelease, source).pipe(
+      catchError((error: unknown) => {
+        if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
+          searchEndpointAvailable = false;
+          return this.searchRegistrationSummary(packageId, includePrerelease, source);
+        }
+        return throwError(() => error);
+      }),
+      switchMap((summary) => {
+        if (summary || includePrerelease) {
+          return summary ? of(summary) : this.searchRegistrationSummary(packageId, includePrerelease, source);
+        }
+
+        const prereleaseSummaryRequest = searchEndpointAvailable
+          ? this.searchSinglePackageSummary(packageId, true, source).pipe(
+              catchError((error: unknown) => {
+                if (error instanceof Error && error.message.includes('does not provide a supported search endpoint')) {
+                  return of(null);
+                }
+                return throwError(() => error);
+              })
+            )
+          : of(null);
+
+        return prereleaseSummaryRequest.pipe(
+          switchMap((prereleaseSummary) => {
+            if (prereleaseSummary) {
+              return prerelease(prereleaseSummary.version) !== null
+                ? of({ ...prereleaseSummary, version: '' })
+                : of(prereleaseSummary);
+            }
+
+            return this.searchRegistrationSummary(packageId, false, source).pipe(
+              switchMap((stableSummary) =>
+                stableSummary
+                  ? of(stableSummary)
+                  : this.searchRegistrationSummary(packageId, true, source).pipe(
+                      map((prereleaseRegistration) =>
+                        prereleaseRegistration && prerelease(prereleaseRegistration.version) !== null
+                          ? { ...prereleaseRegistration, version: '' }
+                          : prereleaseRegistration
+                      )
+                    )
+              )
+            );
+          })
+        );
+      }),
+      catchError((error: unknown) => {
+        this.packageSummaryCache.delete(cacheKey);
+        return throwError(() => error);
+      }),
+      shareReplay({ bufferSize: 1, refCount: false })
+    );
+    this.packageSummaryCache.set(cacheKey, summaryRequest);
+    return summaryRequest;
+  }
+
+  private searchSinglePackageSummary(
+    packageId: string,
+    includePrerelease: boolean,
+    source: PackageSource
+  ): Observable<PackageRowModel | null> {
+    const requestHeaders = this.composeRequestHeaders(source.authorizationHeader);
+    return this.getApiUrl(source.url, requestHeaders, this.searchQueryServiceEndpoints).pipe(
+      switchMap((searchApiUrl) =>
+        this.executeSearch(`packageid:${packageId}`, includePrerelease, searchApiUrl, requestHeaders, 1).pipe(
+          map((results) => {
+            const packageResult = results.data.find((result) => result.id.toLowerCase() === packageId.toLowerCase());
+            return packageResult ? this.mapSearchResultsToPackageRows([packageResult], source.url)[0] : null;
+          })
+        )
+      )
+    );
+  }
+
+  private searchRegistrationSummary(
+    packageId: string,
+    includePrerelease: boolean,
+    source: PackageSource
+  ): Observable<PackageRowModel | null> {
+    return this.searchByPackageIds([packageId], '', includePrerelease, source).pipe(map((packages) => packages[0] ?? null));
+  }
+
+  private getPackageHistory(
+    packageId: string,
+    includePrerelease: boolean,
+    source: PackageSource,
+    metaApiUrl: string,
+    requestHeaders: HttpHeaders
+  ): Observable<PackageRowModel | null> {
+    const cacheKey = JSON.stringify([
+      source.url,
+      source.authorizationHeader ?? '',
+      packageId.toLowerCase(),
+      includePrerelease,
+    ]);
+    const cachedHistory = this.packageHistoryCache.get(cacheKey);
+    if (cachedHistory) {
+      return cachedHistory;
+    }
+
+    const historyRequest = this.executeMetadataGets([packageId], '', includePrerelease, metaApiUrl, requestHeaders, source.url).pipe(
+      map((packages) => packages[0] ?? null),
+      catchError((error: unknown) => {
+        this.packageHistoryCache.delete(cacheKey);
+        return throwError(() => error);
+      }),
+      shareReplay({ bufferSize: 1, refCount: false })
+    );
+    this.packageHistoryCache.set(cacheKey, historyRequest);
+    return historyRequest;
+  }
+
+  private executeSearch(
+    query: string,
+    prerelease: boolean,
+    searchApiUrl: string,
+    authHeaders: HttpHeaders,
+    take?: number
+  ): Observable<SearchResults> {
+    const searchParams: Record<string, string | number | boolean> = {
       q: query,
       prerelease: prerelease,
       semVerLevel: this.VERSION200,
     };
+    if (take !== undefined) {
+      searchParams['take'] = take;
+    }
 
     return this.http.get<SearchResults>(searchApiUrl, {
       headers: authHeaders,
@@ -84,33 +279,28 @@ export class NuGetApiService {
     authHeaders: HttpHeaders,
     sourceUrl: string
   ): Observable<PackageRowModel[]> {
-    const requests: Observable<PackageRowModel | null>[] = [];
+    return from(packageIds).pipe(
+      mergeMap((packageId) => {
+        const metaApiFullUrl = new URL(`${packageId.toLowerCase()}/index.json`, metaApiUrl);
 
-    // compose a list of requests to start in parallel
-    for (const packageId of packageIds) {
-      const metaApiFullUrl = new URL(`${packageId.toLowerCase()}/index.json`, metaApiUrl);
-
-      const request: Observable<PackageRowModel | null> = this.http
-        .get<PackageMetaResponse>(metaApiFullUrl.toString(), {
-          headers: authHeaders,
-        })
-        .pipe(
-          //some packages will not exist on some sources, for these return null and filter after
-          catchError((error: HttpErrorResponse) => (error.status === 404 ? of(null) : throwError(() => error))),
-          switchMap((packageMeta: PackageMetaResponse | null): Observable<RegistrationLeaf[] | null> => {
-            return this.getRegistrationLeafs(packageMeta, authHeaders);
-          }),
-          map((registrationLeafs: RegistrationLeaf[] | null): CatalogEntry[] | null => {
-            return this.getFilteredAndSortedCatalogEntries(registrationLeafs, includePrerelease);
-          }),
-          map((catalogEntries: CatalogEntry[] | null): PackageRowModel | null => {
-            return this.convertCatalogEntriesToPackageRow(catalogEntries, packageId, sourceUrl);
+        return this.http
+          .get<PackageMetaResponse>(metaApiFullUrl.toString(), {
+            headers: authHeaders,
           })
-        );
-      requests.push(request);
-    }
-
-    return forkJoin(requests).pipe(
+          .pipe(
+            catchError((error: HttpErrorResponse) => (error.status === 404 ? of(null) : throwError(() => error))),
+            switchMap((packageMeta: PackageMetaResponse | null): Observable<RegistrationLeaf[] | null> => {
+              return this.getRegistrationLeafs(packageMeta, authHeaders);
+            }),
+            map((registrationLeafs: RegistrationLeaf[] | null): CatalogEntry[] | null => {
+              return this.getFilteredAndSortedCatalogEntries(registrationLeafs, includePrerelease);
+            }),
+            map((catalogEntries: CatalogEntry[] | null): PackageRowModel | null => {
+              return this.convertCatalogEntriesToPackageRow(catalogEntries, packageId, sourceUrl);
+            })
+          );
+      }, this.metadataRequestConcurrency),
+      toArray(),
       map((packageRowResults: (PackageRowModel | null)[]) => {
         return this.filterAndSortPackageRowResults(packageRowResults, query);
       })
@@ -122,34 +312,17 @@ export class NuGetApiService {
       return of(null);
     }
 
-    const allLeafsRequests: Observable<RegistrationLeaf[]>[] = [];
-
-    for (const page of packageMeta.items) {
-      // if the leafs for this page are present in the index, then just return them
-      if (page.items) {
-        allLeafsRequests.push(of(page.items));
-      } else {
-        // need to fetch each page on an individual request to the API
-        const registrationPageRequest = this.http
+    return from(packageMeta.items).pipe(
+      mergeMap((page) => {
+        if (page.items) {
+          return of(page.items);
+        }
+        return this.http
           .get<RegistrationPage>(page['@id'], { headers: authHeaders })
           .pipe(map((registrationPage: RegistrationPage): RegistrationLeaf[] => registrationPage?.items ?? []));
-        allLeafsRequests.push(registrationPageRequest);
-      }
-    }
-
-    if (allLeafsRequests.length === 0) {
-      return of([]);
-    }
-
-    // request all pages in parallel and then concatenate the results into one list
-    return forkJoin(allLeafsRequests).pipe(
-      map((results: RegistrationLeaf[][]): RegistrationLeaf[] => {
-        let finalResult: RegistrationLeaf[] = [];
-        results.forEach((result) => {
-          finalResult = finalResult.concat(result);
-        });
-        return finalResult;
-      })
+      }, this.metadataRequestConcurrency),
+      toArray(),
+      map((results: RegistrationLeaf[][]): RegistrationLeaf[] => results.flat())
     );
   }
 
@@ -247,12 +420,25 @@ export class NuGetApiService {
   }
 
   private getApiUrl(sourceUrl: string, requestHeaders: HttpHeaders, preferedEndpoints: string[]): Observable<string> {
-    return this.http
-      .get<ApiIndexResponse>(sourceUrl, {
-        headers: requestHeaders,
-      })
-      .pipe(
-        map((result: ApiIndexResponse): string => {
+    const cacheKey = JSON.stringify([sourceUrl, requestHeaders.get(this.AUTHORIZATION_HEADER) ?? '']);
+    let serviceIndexRequest = this.serviceIndexCache.get(cacheKey);
+    if (!serviceIndexRequest) {
+      serviceIndexRequest = this.http
+        .get<ApiIndexResponse>(sourceUrl, {
+          headers: requestHeaders,
+        })
+        .pipe(
+          catchError((error: unknown) => {
+            this.serviceIndexCache.delete(cacheKey);
+            return throwError(() => error);
+          }),
+          shareReplay({ bufferSize: 1, refCount: false })
+        );
+      this.serviceIndexCache.set(cacheKey, serviceIndexRequest);
+    }
+
+    return serviceIndexRequest.pipe(
+      map((result: ApiIndexResponse): string => {
           for (const ep of preferedEndpoints) {
             const foundEndpoint = result.resources.find((apiResource: ApiResource): boolean => apiResource['@type'].startsWith(ep));
             if (foundEndpoint) {
@@ -261,8 +447,8 @@ export class NuGetApiService {
           }
           const resourceName = preferedEndpoints[0].startsWith(this.SEARCH_QUERY_SERVICE) ? 'search' : 'registration';
           throw new Error(`The package source does not provide a supported ${resourceName} endpoint.`);
-        })
-      );
+      })
+    );
   }
 
   private mapSearchResultsToPackageRows(

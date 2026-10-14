@@ -1,5 +1,7 @@
 import { Injectable } from '@angular/core';
-import { BehaviorSubject, Observable } from 'rxjs';
+import { BehaviorSubject, Observable, of, Subscription } from 'rxjs';
+import { map, switchMap } from 'rxjs/operators';
+import { coerce } from 'semver';
 
 import { Category } from '../models/category';
 import { PackageRowModel } from '../models/package-row-model';
@@ -16,12 +18,20 @@ import {
 } from '../../../src-common/models/ui-message';
 import { PackageOperationResult } from '../../../src-common/models/extension-message';
 import { NuGetApiService } from './nuget-api.service';
+import { VersionService } from './version.service';
 import { VscodeService } from './vscode.service';
 
 export interface UpdateCountState {
   count: number | null;
   loading: boolean;
   error?: string;
+}
+
+export interface ContextLoadingState {
+  message: string;
+  completed?: number;
+  total?: number;
+  error?: boolean;
 }
 
 @Injectable({
@@ -90,6 +100,18 @@ export class PackageManagerService {
     return this._currentPackagesError.asObservable();
   }
 
+  private _packageQueryLoading = new BehaviorSubject(false);
+  public get packageQueryLoading(): Observable<boolean> {
+    return this._packageQueryLoading.asObservable();
+  }
+
+  private _contextLoading = new BehaviorSubject<ContextLoadingState | null>({
+    message: 'Loading project and package references...',
+  });
+  public get contextLoading(): Observable<ContextLoadingState | null> {
+    return this._contextLoading.asObservable();
+  }
+
   private _currentSelectedPackage = new BehaviorSubject<PackageRowModel | null>(null);
   public get currentSelectedPackage(): Observable<PackageRowModel | null> {
     return this._currentSelectedPackage.asObservable();
@@ -111,10 +133,19 @@ export class PackageManagerService {
   private readonly pendingPackageOperations = new Set<string>();
   private readonly packageOperationProgressMessages = new Map<string, string>();
   private packageOperationSequence = 0;
+  private packageQuerySequence = 0;
+  private packageQuerySubscription: Subscription | undefined;
   private updateCountRequestSequence = 0;
   private lastUpdateCountKey: string | undefined;
+  private initialPackageMetadataLoadPending = true;
+  private packageResultsCache = new Map<string, { packages: PackageRowModel[]; updateCount?: number }>();
+  private warmedPackageInfo: { key: string; packages: PackageRowModel[]; updateCount: number } | undefined;
 
-  constructor(private nugetService: NuGetApiService, private vscodeService: VscodeService) {
+  constructor(
+    private nugetService: NuGetApiService,
+    private versionService: VersionService,
+    private vscodeService: VscodeService
+  ) {
     // tell the extension to load the project and it's installed packages
     // now we are sure the UI is loaded and ready to receive the message
     vscodeService.postMessage({
@@ -122,53 +153,205 @@ export class PackageManagerService {
     });
   }
 
-  public queryForPackages(query: string, prerelease: boolean, source: PackageSource): void {
+  public queryForPackages(
+    query: string,
+    prerelease: boolean,
+    source: PackageSource,
+    forceRefresh = true,
+    refreshFeed = false
+  ): void {
+    const currentCategory = this._currentCategory.value;
+    this._currentSource = source;
+    this._currentPrerelease = prerelease;
+
+    if (currentCategory !== Category.Browse && !this._currentProject.value && !this._currentSolution.value) {
+      return;
+    }
+
+    const cacheKey = this.packageResultsCacheKey(query, prerelease, source, currentCategory);
+    if (!forceRefresh) {
+      const cachedResult = this.packageResultsCache.get(cacheKey);
+      if (cachedResult) {
+        this.packageQuerySubscription?.unsubscribe();
+        this.packageQuerySubscription = undefined;
+        this.packageQuerySequence++;
+        this._currentSelectedPackage.next(null);
+        this._currentPackagesError.next(null);
+        this._currentSelectedPackageError.next(null);
+        this._packageQueryLoading.next(false);
+        if (cachedResult.updateCount !== undefined) {
+          this._availableUpdateCount.next({ count: cachedResult.updateCount, loading: false });
+        }
+        this.setCurrentPackages(this.copyPackageRows(cachedResult.packages), true);
+        return;
+      }
+    } else {
+      this.packageResultsCache.clear();
+      if (refreshFeed) {
+        this.warmedPackageInfo = undefined;
+        this.lastUpdateCountKey = undefined;
+        this.nugetService.clearPackageCache(source);
+      }
+    }
+
+    this.packageQuerySubscription?.unsubscribe();
+    this.packageQuerySubscription = undefined;
+    const requestId = ++this.packageQuerySequence;
     const selectedPackageId = this._currentSelectedPackageId.value;
     this._currentSelectedPackage.next(null);
     this._currentSelectedPackageId.next(selectedPackageId);
     this._currentPackages.next(null);
     this._currentPackagesError.next(null);
+    this._packageQueryLoading.next(true);
     this._currentSelectedPackageError.next(null);
 
-    this._currentSource = source;
-    this._currentPrerelease = prerelease;
-    this.refreshAvailableUpdateCount();
-
-    const currentCategory = this._currentCategory.value;
+    const installedQueryCanShareMetadata = currentCategory === Category.Installed && !query.trim();
+    if (currentCategory === Category.Updates) {
+      this._availableUpdateCount.next({ count: null, loading: true });
+    } else if (installedQueryCanShareMetadata) {
+      this._availableUpdateCount.next({ count: null, loading: true });
+    } else {
+      this.refreshAvailableUpdateCount();
+    }
 
     if (currentCategory === Category.Browse) {
-      this.nugetService.search(query, prerelease, source).subscribe({
+      this.packageQuerySubscription = this.nugetService.search(query, prerelease, source).subscribe({
         next: (packageRowModels: PackageRowModel[]) => {
+          if (requestId !== this.packageQuerySequence) {
+            return;
+          }
           this._currentPackagesError.next(null);
+          this._packageQueryLoading.next(false);
           this.setCurrentPackages(packageRowModels);
+          this.cachePackageResults(cacheKey, packageRowModels);
         },
-        error: () => this.setPackageQueryError(),
+        error: () => {
+          if (requestId === this.packageQuerySequence) {
+            this._packageQueryLoading.next(false);
+            this.setPackageQueryError();
+          }
+        },
       });
     } else {
       const currentInstalledPackageIds =
-        currentCategory === Category.Updates || currentCategory === Category.Consolidate
-          ? this.getDirectInstalledPackageIds()
-          : this.getCurrentInstalledPackageIds();
+        currentCategory === Category.Consolidate ? this.getDirectInstalledPackageIds() : this.getCurrentInstalledPackageIds();
       if (currentInstalledPackageIds.length) {
-        this.nugetService
-          .searchByPackageIds(currentInstalledPackageIds, query, prerelease, source)
-          .subscribe({
+        const allLocalInstalledPackages =
+          currentCategory === Category.Installed ? this.getLocalInstalledPackages(source.url) : [];
+        const localInstalledPackages = allLocalInstalledPackages.filter((packageRow) => this.packageRowMatchesQuery(packageRow, query));
+        const warmedPackageInfo = this.getWarmedPackageInfo(source, prerelease);
+        if (currentCategory === Category.Installed && !warmedPackageInfo) {
+          this.setCurrentPackages(localInstalledPackages);
+        }
+
+        const packageIds = new Set(currentInstalledPackageIds.map((packageId) => packageId.toLowerCase()));
+        const packageLookup = warmedPackageInfo
+          ? of(
+              warmedPackageInfo.packages.filter(
+                (packageRow) =>
+                  packageIds.has(packageRow.id.toLowerCase()) && this.packageRowMatchesQuery(packageRow, query)
+              )
+            )
+          : this.nugetService.searchByPackageIds(currentInstalledPackageIds, query, prerelease, source, false);
+        const packageResults =
+          !warmedPackageInfo && (currentCategory === Category.Updates || installedQueryCanShareMetadata)
+            ? packageLookup.pipe(switchMap((packages) => this.resolveConstrainedUpdateCandidates(packages, source, prerelease)))
+            : packageLookup;
+        this.packageQuerySubscription = packageResults.subscribe({
             next: (packageRowModels: PackageRowModel[]) => {
+              if (requestId !== this.packageQuerySequence) {
+                return;
+              }
+              const loadedPackageRows = packageRowModels;
               this._currentPackagesError.next(null);
-              packageRowModels = this.filterResultsToMatchCategory(packageRowModels);
+              this._packageQueryLoading.next(false);
+              let updateCount: number | undefined;
+              if (currentCategory === Category.Updates) {
+                const packagesWithUpdates = packageRowModels.filter(
+                  (packageRow) => packageRow.version.length > 0 && this.hasDirectUpdate(packageRow)
+                );
+                if (!query.trim() && warmedPackageInfo) {
+                  updateCount = warmedPackageInfo.updateCount;
+                } else {
+                  updateCount = new Set(packagesWithUpdates.map((packageRow) => packageRow.id.toLowerCase())).size;
+                }
+                packageRowModels = packagesWithUpdates;
+                this._availableUpdateCount.next({ count: updateCount, loading: false });
+              } else if (installedQueryCanShareMetadata) {
+                if (warmedPackageInfo) {
+                  updateCount = warmedPackageInfo.updateCount;
+                } else {
+                  const updatedPackageIds = new Set(
+                    packageRowModels
+                      .filter((packageRow) => packageRow.version.length > 0 && this.hasDirectUpdate(packageRow))
+                      .map((packageRow) => packageRow.id.toLowerCase())
+                  );
+                  updateCount = updatedPackageIds.size;
+                }
+                this._availableUpdateCount.next({ count: updateCount, loading: false });
+              }
+              if (
+                !query.trim() &&
+                warmedPackageInfo === undefined &&
+                (currentCategory === Category.Updates || installedQueryCanShareMetadata)
+              ) {
+                this.storeWarmedPackageInfo(source, prerelease, loadedPackageRows, updateCount ?? 0);
+              }
+              if (currentCategory === Category.Installed) {
+                packageRowModels = this.mergeWithLocalInstalledPackages(
+                  packageRowModels,
+                  localInstalledPackages,
+                  allLocalInstalledPackages
+                );
+              }
+              if (currentCategory !== Category.Updates) {
+                packageRowModels = this.filterResultsToMatchCategory(packageRowModels);
+              }
               this.setCurrentPackages(packageRowModels);
+              this.cachePackageResults(cacheKey, packageRowModels, updateCount);
             },
-            error: () => this.setPackageQueryError(),
+            error: () => {
+              if (requestId === this.packageQuerySequence) {
+                this._packageQueryLoading.next(false);
+                if (currentCategory === Category.Updates) {
+                  this._availableUpdateCount.next({
+                    count: null,
+                    loading: false,
+                    error: 'Could not load available updates from the selected source.',
+                  });
+                } else if (installedQueryCanShareMetadata) {
+                  this._availableUpdateCount.next({
+                    count: null,
+                    loading: false,
+                    error: 'Could not load available updates from the selected source.',
+                  });
+                }
+                this.setPackageQueryError();
+              }
+            },
           });
       } else {
+        this._packageQueryLoading.next(false);
+        if (currentCategory === Category.Updates) {
+          this._availableUpdateCount.next({ count: 0, loading: false });
+        } else if (installedQueryCanShareMetadata) {
+          this._availableUpdateCount.next({ count: 0, loading: false });
+        }
         this.setCurrentPackages([]);
+        this.cachePackageResults(
+          cacheKey,
+          [],
+          currentCategory === Category.Updates || installedQueryCanShareMetadata ? 0 : undefined
+        );
       }
     }
   }
 
   public changeCurrentProject(project: Project) {
+    this._contextLoading.next(null);
     this._currentSolution.next(null);
     this.packageProjectSelections.clear();
+    this.packageResultsCache.clear();
     this._currentProject.next(project);
     this.resetUnavailableConsolidateCategory();
     this.refreshAvailableUpdateCount();
@@ -180,9 +363,11 @@ export class PackageManagerService {
   }
 
   public changeCurrentSolution(solution: Solution): void {
+    this._contextLoading.next(null);
     const previousSolution = this._currentSolution.value;
     this._currentProject.next(null);
     this._currentSolution.next(solution);
+    this.packageResultsCache.clear();
     if (previousSolution?.fsPath !== solution.fsPath) {
       this.packageProjectSelections.clear();
     } else {
@@ -251,6 +436,31 @@ export class PackageManagerService {
     this._currentSources.next(sources);
   }
 
+  public setContextLoading(message: string, completed?: number, total?: number): void {
+    this.packageQuerySubscription?.unsubscribe();
+    this.packageQuerySubscription = undefined;
+    this.packageQuerySequence++;
+    this.updateCountRequestSequence++;
+    this.lastUpdateCountKey = undefined;
+    this._availableUpdateCount.next({ count: null, loading: false });
+    this._contextLoading.next({ message, completed, total });
+    this._packageQueryLoading.next(false);
+    this._currentPackagesError.next(null);
+  }
+
+  public setContextLoadError(message: string): void {
+    this.packageQuerySubscription?.unsubscribe();
+    this.packageQuerySubscription = undefined;
+    this.packageQuerySequence++;
+    this.updateCountRequestSequence++;
+    this.lastUpdateCountKey = undefined;
+    this._contextLoading.next({ message, error: true });
+    this._currentPackages.next(null);
+    this._packageQueryLoading.next(false);
+    this._currentPackagesError.next(null);
+    this._availableUpdateCount.next({ count: null, loading: false });
+  }
+
   public changeCurrentSelectedPackage(selectedPackage: PackageRowModel | null): void {
     this._currentSelectedPackageError.next(null);
     // set the current selected package id so that the list highlights it
@@ -272,9 +482,21 @@ export class PackageManagerService {
             );
             return;
           }
+          selectedPackage.version = packageWithVersions.version;
+          selectedPackage.description = packageWithVersions.description;
+          selectedPackage.authors = packageWithVersions.authors;
+          selectedPackage.iconUrl = packageWithVersions.iconUrl;
+          selectedPackage.totalDownloads = packageWithVersions.totalDownloads;
+          selectedPackage.verified = packageWithVersions.verified;
+          selectedPackage.sourceUrl = packageWithVersions.sourceUrl;
           selectedPackage.versions = packageWithVersions.versions;
           selectedPackage.vulnerabilities = packageWithVersions.vulnerabilities ?? selectedPackage.vulnerabilities;
           selectedPackage.deprecation = packageWithVersions.deprecation ?? selectedPackage.deprecation;
+          this.setInstalledInformation([selectedPackage]);
+          const currentPackages = this._currentPackages.value;
+          if (currentPackages?.includes(selectedPackage)) {
+            this._currentPackages.next([...currentPackages]);
+          }
           this._currentSelectedPackage.next(selectedPackage);
         },
         error: () => {
@@ -294,8 +516,33 @@ export class PackageManagerService {
     if (packageToInstall === null || this.isPackageOperationInProgress) {
       return;
     }
-    const selectedPaths = projectPaths ?? this.selectedProjectsForPackage(packageToInstall.id);
-    if (this._currentSolution.value && selectedPaths.length === 0) {
+    const requestedVersion = version ?? packageToInstall.version;
+    const currentSolution = this._currentSolution.value;
+    let selectedPaths = projectPaths ?? this.selectedProjectsForPackage(packageToInstall.id);
+    if (currentSolution) {
+      selectedPaths = selectedPaths.filter((projectPath) => {
+        const installedPackage = currentSolution.projects
+          .find((project) => project.fsPath === projectPath)
+          ?.packages.find((item) => item.id.toLowerCase() === packageToInstall.id.toLowerCase());
+        return (
+          !installedPackage ||
+          installedPackage.packageLevel === 'transitive' ||
+          this.isVersionAllowedForInstalledPackage(installedPackage, requestedVersion)
+        );
+      });
+    } else {
+      const installedPackage = this._currentProject.value?.packages.find(
+        (item) => item.id.toLowerCase() === packageToInstall.id.toLowerCase()
+      );
+      if (
+        installedPackage &&
+        installedPackage.packageLevel !== 'transitive' &&
+        !this.isVersionAllowedForInstalledPackage(installedPackage, requestedVersion)
+      ) {
+        return;
+      }
+    }
+    if (currentSolution && selectedPaths.length === 0) {
       return;
     }
     const installMessage = this.mapPackageToInstallMessage(packageToInstall, version, selectedPaths, includeCpmExceptions);
@@ -471,6 +718,9 @@ export class PackageManagerService {
   }
 
   private postPackageOperation(message: UIMessage): void {
+    this.packageResultsCache.clear();
+    this.warmedPackageInfo = undefined;
+    this.lastUpdateCountKey = undefined;
     if (message.command !== 'rollback-package-update') {
       this._operationResults.next([]);
       this._rollbackId.next(null);
@@ -490,9 +740,14 @@ export class PackageManagerService {
   private setInstalledInformation(packageRowModels: PackageRowModel[]): void {
     const currentSolution = this._currentSolution.value;
     if (currentSolution) {
+      const packagesByProject = currentSolution.projects.map(
+        (project) => new Map(project.packages.map((installedPackage) => [installedPackage.id.toLowerCase(), installedPackage]))
+      );
       packageRowModels.forEach((packageRowModel) => {
-        const projectStates = currentSolution.projects.map((project) => {
-          const installedPackage = project.packages.find((item) => item.id.toLowerCase() === packageRowModel.id.toLowerCase());
+        const packageId = packageRowModel.id.toLowerCase();
+        const installedPackages = packagesByProject.map((packages) => packages.get(packageId));
+        const projectStates = currentSolution.projects.map((project, index) => {
+          const installedPackage = installedPackages[index];
           return {
             projectPath: project.fsPath,
             projectName: project.name,
@@ -516,7 +771,13 @@ export class PackageManagerService {
         packageRowModel.versionSource = versionSources.size === 1 ? Array.from(versionSources)[0] : versionSources.size > 1 ? 'mixed' : undefined;
         const packageLevels = new Set<PackageLevel>(installedStates.flatMap((state) => (state.packageLevel ? [state.packageLevel] : [])));
         packageRowModel.packageLevel = packageLevels.size === 1 ? Array.from(packageLevels)[0] : packageLevels.size > 1 ? 'mixed' : undefined;
-        packageRowModel.isOutdated = installedStates.some((state) => state.installedVersion !== packageRowModel.version);
+        packageRowModel.isOutdated = installedPackages.some(
+          (installedPackage) =>
+            installedPackage !== undefined &&
+            installedPackage.packageLevel !== 'transitive' &&
+            this.hasNewerVersion(installedPackage.version, packageRowModel.version) &&
+            this.isVersionAllowedForInstalledPackage(installedPackage, packageRowModel.version)
+        );
       });
       return;
     }
@@ -524,22 +785,27 @@ export class PackageManagerService {
     const currentInstalledPackages = this._currentProject.value?.packages;
 
     if (currentInstalledPackages) {
+      const packagesById = new Map(currentInstalledPackages.map((installedPackage) => [installedPackage.id.toLowerCase(), installedPackage]));
       packageRowModels.forEach((packageRowModel: PackageRowModel) => {
-        const installedPackage = currentInstalledPackages.find(
-          (currentPackage: InstalledPackage) => currentPackage.id.toLowerCase() === packageRowModel.id.toLowerCase()
-        );
+        const installedPackage = packagesById.get(packageRowModel.id.toLowerCase());
 
         packageRowModel.isInstalled = installedPackage !== undefined;
         packageRowModel.installedVersion = installedPackage ? installedPackage.version : '';
         packageRowModel.versionSource = installedPackage?.versionSource;
         packageRowModel.packageLevel = installedPackage?.packageLevel;
-        packageRowModel.isOutdated = packageRowModel.isInstalled && packageRowModel.installedVersion !== packageRowModel.version;
+        packageRowModel.isOutdated =
+          installedPackage !== undefined &&
+          installedPackage.packageLevel !== 'transitive' &&
+          this.hasNewerVersion(installedPackage.version, packageRowModel.version) &&
+          this.isVersionAllowedForInstalledPackage(installedPackage, packageRowModel.version);
       });
     }
   }
 
-  private setCurrentPackages(packageRowModels: PackageRowModel[]): void {
-    this.setInstalledInformation(packageRowModels);
+  private setCurrentPackages(packageRowModels: PackageRowModel[], installedInformationComplete = false): void {
+    if (!installedInformationComplete) {
+      this.setInstalledInformation(packageRowModels);
+    }
     this._currentPackages.next(packageRowModels);
 
     const selectedPackageId = this._currentSelectedPackageId.value;
@@ -549,33 +815,187 @@ export class PackageManagerService {
     this.changeCurrentSelectedPackage(selectedPackage);
   }
 
+  private getLocalInstalledPackages(sourceUrl: string): PackageRowModel[] {
+    const projects = this._currentSolution.value
+      ? this._currentSolution.value.projects
+      : this._currentProject.value
+        ? [this._currentProject.value]
+        : [];
+    const installedById = new Map<string, InstalledPackage[]>();
+
+    projects.forEach((project) => {
+      project.packages.forEach((installedPackage) => {
+        const key = installedPackage.id.toLowerCase();
+        const entries = installedById.get(key) ?? [];
+        entries.push(installedPackage);
+        installedById.set(key, entries);
+      });
+    });
+
+    return Array.from(installedById.values())
+      .map((entries) => {
+        const versions = new Set(entries.map((entry) => entry.version));
+        const packageLevels = new Set(entries.map((entry) => entry.packageLevel ?? 'unknown'));
+        const packageLevel: PackageLevel =
+          packageLevels.size > 1 ? 'mixed' : (Array.from(packageLevels)[0] ?? 'unknown');
+        const version = versions.size === 1 ? entries[0].version : 'Varies by project';
+        return {
+          id: entries[0].id,
+          version,
+          description: '',
+          authors: [],
+          iconUrl: '',
+          totalDownloads: undefined,
+          verified: false,
+          isInstalled: true,
+          installedVersion: version,
+          isOutdated: false,
+          sourceUrl,
+          packageLevel,
+          versions: undefined,
+        };
+      })
+      .sort((first, second) => first.id.localeCompare(second.id));
+  }
+
+  private mergeWithLocalInstalledPackages(
+    packageRowModels: PackageRowModel[],
+    localInstalledPackages: PackageRowModel[],
+    allLocalInstalledPackages: PackageRowModel[]
+  ): PackageRowModel[] {
+    const packagesById = new Map(localInstalledPackages.map((packageRow) => [packageRow.id.toLowerCase(), packageRow]));
+    const allLocalPackagesById = new Map(allLocalInstalledPackages.map((packageRow) => [packageRow.id.toLowerCase(), packageRow]));
+    packageRowModels.forEach((packageRow) => {
+      const packageId = packageRow.id.toLowerCase();
+      const localPackage = packagesById.get(packageId) ?? allLocalPackagesById.get(packageId);
+      packagesById.set(
+        packageId,
+        localPackage && !packageRow.version
+          ? { ...localPackage, ...packageRow, version: localPackage.version, installedVersion: localPackage.installedVersion }
+          : packageRow
+      );
+    });
+    return Array.from(packagesById.values()).sort((first, second) => first.id.localeCompare(second.id));
+  }
+
+  private packageRowMatchesQuery(packageRow: PackageRowModel, query: string): boolean {
+    const normalizedQuery = query.trim().toLowerCase();
+    return !normalizedQuery || packageRow.id.toLowerCase().includes(normalizedQuery) || packageRow.description.toLowerCase().includes(normalizedQuery);
+  }
+
+  private packageResultsCacheKey(query: string, prerelease: boolean, source: PackageSource, category: Category): string {
+    return JSON.stringify([
+      category,
+      query,
+      prerelease,
+      source.url,
+      source.authorizationHeader ?? '',
+      category === Category.Browse ? '' : this.getInstalledPackageDataKey(source, prerelease),
+    ]);
+  }
+
+  private cachePackageResults(key: string, packages: PackageRowModel[], updateCount?: number): void {
+    this.packageResultsCache.set(key, { packages: this.copyPackageRows(packages), updateCount });
+  }
+
+  private copyPackageRows(packages: PackageRowModel[]): PackageRowModel[] {
+    return packages.map((packageRow) => ({
+      ...packageRow,
+      versions: packageRow.versions ? [...packageRow.versions] : undefined,
+      solutionProjectStates: packageRow.solutionProjectStates?.map((state) => ({
+        ...state,
+        targetFrameworkVersions: state.targetFrameworkVersions?.map((version) => ({ ...version })),
+      })),
+    }));
+  }
+
+  private getInstalledPackageDataKey(source: PackageSource, prerelease: boolean): string {
+    const projects = this._currentSolution.value
+      ? this._currentSolution.value.projects
+      : this._currentProject.value
+        ? [this._currentProject.value]
+        : [];
+    const installedPackages = projects.flatMap((project) =>
+      project.packages.map((installedPackage) => ({
+        projectPath: project.fsPath.toLowerCase(),
+        id: installedPackage.id.toLowerCase(),
+        version: installedPackage.version,
+        packageLevel: installedPackage.packageLevel ?? '',
+        requestedVersions: (installedPackage.targetFrameworkVersions ?? [])
+          .filter((frameworkVersion) => frameworkVersion.packageLevel !== 'transitive')
+          .map((frameworkVersion) => frameworkVersion.requestedVersion ?? '')
+          .sort(),
+      }))
+    );
+    installedPackages.sort(
+      (left, right) =>
+        left.projectPath.localeCompare(right.projectPath) ||
+        left.id.localeCompare(right.id) ||
+        left.version.localeCompare(right.version)
+    );
+    return JSON.stringify([
+      source.url,
+      source.authorizationHeader ?? '',
+      prerelease,
+      ...installedPackages,
+    ]);
+  }
+
+  private getWarmedPackageInfo(
+    source: PackageSource,
+    prerelease: boolean
+  ): { packages: PackageRowModel[]; updateCount: number } | undefined {
+    const key = this.getInstalledPackageDataKey(source, prerelease);
+    return this.warmedPackageInfo?.key === key ? this.warmedPackageInfo : undefined;
+  }
+
+  private storeWarmedPackageInfo(source: PackageSource, prerelease: boolean, packages: PackageRowModel[], updateCount: number): void {
+    this.warmedPackageInfo = {
+      key:             this.getInstalledPackageDataKey(source, prerelease),
+      packages: this.copyPackageRows(packages),
+      updateCount,
+    };
+  }
+
   private filterResultsToMatchCategory(packageRowModels: PackageRowModel[]): PackageRowModel[] {
     const currentCategory = this._currentCategory.value;
 
-    if (currentCategory === Category.Updates) {
-      return packageRowModels.filter((packageRowModel: PackageRowModel) => this.hasDirectUpdate(packageRowModel));
-    }
     if (currentCategory === Category.Consolidate) {
       const consolidatablePackageIds = this.getConsolidatablePackageIds();
-      return packageRowModels.filter((packageRowModel) => consolidatablePackageIds.has(packageRowModel.id.toLowerCase()));
+      return packageRowModels.filter(
+        (packageRowModel) => packageRowModel.version.length > 0 && consolidatablePackageIds.has(packageRowModel.id.toLowerCase())
+      );
     }
 
     return packageRowModels;
   }
 
   private getCurrentInstalledPackageIds(): string[] {
+    return Array.from(
+      new Map(this.getCurrentInstalledPackages().map((installedPackage) => [installedPackage.id.toLowerCase(), installedPackage.id])).values()
+    );
+  }
+
+  private getCurrentInstalledPackages(): Array<{ id: string; version: string; projectPath: string }> {
     const currentSolution = this._currentSolution.value;
     if (currentSolution) {
-      return Array.from(new Set(currentSolution.projects.flatMap((project) => project.packages.map((installedPackage) => installedPackage.id))));
+      return currentSolution.projects.flatMap((project) =>
+        project.packages.map((installedPackage) => ({
+          id: installedPackage.id,
+          version: installedPackage.version,
+          projectPath: project.fsPath,
+        }))
+      );
     }
 
-    const currentInstalledPackages = this._currentProject.value?.packages;
-
-    if (!currentInstalledPackages) {
-      return [];
-    }
-
-    return currentInstalledPackages.map((installedPackage: InstalledPackage) => installedPackage.id);
+    const currentProject = this._currentProject.value;
+    return (
+      currentProject?.packages.map((installedPackage: InstalledPackage) => ({
+        id: installedPackage.id,
+        version: installedPackage.version,
+        projectPath: currentProject.fsPath,
+      })) ?? []
+    );
   }
 
   private getDirectInstalledPackages(): Array<{ id: string; version: string; projectPath: string }> {
@@ -607,7 +1027,107 @@ export class PackageManagerService {
     return (
       installedPackage !== undefined &&
       installedPackage.packageLevel !== 'transitive' &&
-      installedPackage.version !== packageToUpdate.version
+      this.hasNewerVersion(installedPackage.version, packageToUpdate.version) &&
+      this.isVersionAllowedForInstalledPackage(installedPackage, packageToUpdate.version)
+    );
+  }
+
+  private hasNewerVersion(installedVersion: string, candidateVersion: string): boolean {
+    if (installedVersion === candidateVersion) {
+      return false;
+    }
+
+    const comparison = this.versionService.compareSemVers(installedVersion, candidateVersion);
+    if (comparison !== 0) {
+      return comparison === 1;
+    }
+
+    return coerce(installedVersion) === null || coerce(candidateVersion) === null;
+  }
+
+  private getDirectInstalledPackagesForId(packageId: string): InstalledPackage[] {
+    const projects = this._currentSolution.value
+      ? this._currentSolution.value.projects
+      : this._currentProject.value
+        ? [this._currentProject.value]
+        : [];
+    return projects.flatMap((project) =>
+      project.packages.filter(
+        (installedPackage) =>
+          installedPackage.id.toLowerCase() === packageId.toLowerCase() && installedPackage.packageLevel !== 'transitive'
+      )
+    );
+  }
+
+  private getDeclaredVersionRanges(installedPackage: InstalledPackage): string[] {
+    return Array.from(
+      new Set(
+        (installedPackage.targetFrameworkVersions ?? [])
+          .filter((frameworkVersion) => frameworkVersion.packageLevel !== 'transitive')
+          .flatMap((frameworkVersion) => (frameworkVersion.requestedVersion ? [frameworkVersion.requestedVersion] : []))
+      )
+    );
+  }
+
+  private isVersionAllowedForInstalledPackage(installedPackage: InstalledPackage, candidateVersion: string): boolean {
+    return this.getDeclaredVersionRanges(installedPackage).every((versionRange) =>
+      this.versionService.satisfiesVersionRange(candidateVersion, versionRange)
+    );
+  }
+
+  private resolveConstrainedUpdateCandidates(
+    packageRowModels: PackageRowModel[],
+    source: PackageSource,
+    prerelease: boolean
+  ): Observable<PackageRowModel[]> {
+    const packagesNeedingHistory = packageRowModels.filter((packageRow) => {
+      if (!packageRow.version) {
+        return false;
+      }
+      const directPackages = this.getDirectInstalledPackagesForId(packageRow.id);
+      return (
+        directPackages.some((installedPackage) => this.getDeclaredVersionRanges(installedPackage).length > 0) &&
+        !directPackages.some((installedPackage) => this.isVersionAllowedForInstalledPackage(installedPackage, packageRow.version))
+      );
+    });
+    if (packagesNeedingHistory.length === 0) {
+      return of(packageRowModels);
+    }
+
+    const packageIds = packagesNeedingHistory.map((packageRow) => packageRow.id);
+    return this.nugetService.searchByPackageIds(packageIds, '', prerelease, source, true).pipe(
+      map((historyRows) => {
+        const historiesById = new Map(historyRows.map((packageRow) => [packageRow.id.toLowerCase(), packageRow]));
+        return packageRowModels.map((packageRow) => {
+          if (!packagesNeedingHistory.some((item) => item.id.toLowerCase() === packageRow.id.toLowerCase())) {
+            return packageRow;
+          }
+
+          const history = historiesById.get(packageRow.id.toLowerCase());
+          const directPackages = this.getDirectInstalledPackagesForId(packageRow.id);
+          const allowedCandidate = history?.versions?.find((version) =>
+            directPackages.some(
+              (installedPackage) =>
+                this.hasNewerVersion(installedPackage.version, version.version) &&
+                this.isVersionAllowedForInstalledPackage(installedPackage, version.version)
+            )
+          );
+          if (!history || !allowedCandidate) {
+            return packageRow;
+          }
+
+          return {
+            ...packageRow,
+            version: allowedCandidate.version,
+            description: allowedCandidate.description ?? packageRow.description,
+            authors: allowedCandidate.authors,
+            iconUrl: allowedCandidate.iconUrl ?? packageRow.iconUrl,
+            vulnerabilities: allowedCandidate.vulnerabilities,
+            deprecation: allowedCandidate.deprecation,
+            versions: history.versions,
+          };
+        });
+      })
     );
   }
 
@@ -685,25 +1205,17 @@ export class PackageManagerService {
       return;
     }
 
-    const installedPackages = this.getDirectInstalledPackages();
-    const key = JSON.stringify([
-      this._currentSource.url,
-      this._currentSource.authorizationHeader ?? '',
-      this._currentPrerelease,
-      ...installedPackages.map((item) => `${item.projectPath.toLowerCase()}|${item.id.toLowerCase()}|${item.version}`).sort(),
-    ]);
+    const allInstalledPackages = this.getCurrentInstalledPackages();
+    const key = this.getInstalledPackageDataKey(this._currentSource, this._currentPrerelease);
     if (key === this.lastUpdateCountKey && !this._availableUpdateCount.value.error) {
       return;
     }
     this.lastUpdateCountKey = key;
 
     const requestId = ++this.updateCountRequestSequence;
-    const versionsByPackageId = new Map<string, string[]>();
-    installedPackages.forEach((installedPackage) => {
-      const id = installedPackage.id.toLowerCase();
-      versionsByPackageId.set(id, [...(versionsByPackageId.get(id) ?? []), installedPackage.version]);
-    });
-    const packageIds = Array.from(new Map(installedPackages.map((item) => [item.id.toLowerCase(), item.id])).values());
+    const packageIds = Array.from(
+      new Map(allInstalledPackages.map((item) => [item.id.toLowerCase(), item.id])).values()
+    );
     if (packageIds.length === 0) {
       this._availableUpdateCount.next({ count: 0, loading: false });
       return;
@@ -712,31 +1224,48 @@ export class PackageManagerService {
     const source = this._currentSource;
     const prerelease = this._currentPrerelease;
     this._availableUpdateCount.next({ count: null, loading: true });
-    this.nugetService.searchByPackageIds(packageIds, '', prerelease, source).subscribe({
+    const isInitialMetadataLoad = this.initialPackageMetadataLoadPending;
+    if (isInitialMetadataLoad) {
+      this._contextLoading.next({ message: 'Loading installed package information from the selected source...' });
+    }
+    this.nugetService
+      .searchByPackageIds(packageIds, '', prerelease, source, false)
+      .pipe(switchMap((packages) => this.resolveConstrainedUpdateCandidates(packages, source, prerelease)))
+      .subscribe({
       next: (packages) => {
         if (requestId !== this.updateCountRequestSequence) {
           return;
         }
         const updatedPackageIds = new Set(
           packages
-            .filter((packageRow) =>
-              (versionsByPackageId.get(packageRow.id.toLowerCase()) ?? []).some((installedVersion) => installedVersion !== packageRow.version)
-            )
+            .filter((packageRow) => packageRow.version.length > 0 && this.hasDirectUpdate(packageRow))
             .map((packageRow) => packageRow.id.toLowerCase())
         );
         this._availableUpdateCount.next({ count: updatedPackageIds.size, loading: false });
+        this.storeWarmedPackageInfo(source, prerelease, packages, updatedPackageIds.size);
+        this.completeInitialPackageMetadataLoad(isInitialMetadataLoad);
       },
-      error: (error: unknown) => {
+      error: () => {
         if (requestId !== this.updateCountRequestSequence) {
           return;
         }
         this._availableUpdateCount.next({
           count: null,
           loading: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: 'Could not load available updates from the selected source.',
         });
+        this.completeInitialPackageMetadataLoad(isInitialMetadataLoad);
       },
-    });
+      });
+  }
+
+  private completeInitialPackageMetadataLoad(isInitialMetadataLoad: boolean): void {
+    if (!isInitialMetadataLoad) {
+      return;
+    }
+
+    this.initialPackageMetadataLoadPending = false;
+    this._contextLoading.next(null);
   }
 
   private updatePackageOperationProgress(): void {

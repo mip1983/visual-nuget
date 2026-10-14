@@ -1,6 +1,7 @@
 import { TestBed } from '@angular/core/testing';
-import { of, skip, take, throwError, zip } from 'rxjs';
+import { of, skip, Subject, take, throwError, zip } from 'rxjs';
 import { Category } from '../models/category';
+import { CatalogEntry } from '../models/package-meta';
 import { PackageRowModel } from '../models/package-row-model';
 import { PackageOperationResult } from '../../../src-common/models/extension-message';
 import { PackageSource } from '../../../src-common/models/package-source';
@@ -12,7 +13,7 @@ import { VscodeService } from './vscode.service';
 describe('PackageManagerService', () => {
   let service: PackageManagerService;
 
-  let nugetApiServiceMock: { search: jest.Mock; searchByPackageIds: jest.Mock };
+  let nugetApiServiceMock: { search: jest.Mock; searchByPackageIds: jest.Mock; clearPackageCache: jest.Mock };
 
   let vscodeServiceMock: { postMessage: jest.Mock };
 
@@ -20,6 +21,7 @@ describe('PackageManagerService', () => {
     nugetApiServiceMock = {
       search: jest.fn(),
       searchByPackageIds: jest.fn().mockReturnValue(of([])),
+      clearPackageCache: jest.fn(),
     };
     vscodeServiceMock = {
       postMessage: jest.fn(),
@@ -107,6 +109,229 @@ describe('PackageManagerService', () => {
     service.changeCurrentCategory(expectedCategory);
   });
 
+  test('queryForPackages keeps installed results pending until project context has loaded', () => {
+    const source = getMockPackageSource();
+    service.changeCurrentCategory(Category.Installed);
+
+    const state: { packages: PackageRowModel[] | null } = { packages: [] };
+    service.currentPackages.subscribe((value) => (state.packages = value));
+    service.queryForPackages('', false, source);
+
+    expect(state.packages).toBeNull();
+    expect(nugetApiServiceMock.searchByPackageIds).not.toHaveBeenCalled();
+
+    service.changeCurrentProject(getMockCurrentProject());
+    service.queryForPackages('', false, source);
+
+    expect(state.packages?.map((packageRow) => packageRow.id)).toEqual(['Package1', 'Package2']);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+  });
+
+  test('queryForPackages loads the unfiltered installed inventory locally without source metadata', () => {
+    const project = getMockCurrentProject();
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Installed);
+
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let loading = false;
+    service.currentPackages.subscribe((value) => (state.packages = value));
+    service.packageQueryLoading.subscribe((value) => (loading = value));
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    expect(state.packages?.map((packageRow) => packageRow.id)).toEqual(project.packages.map((item) => item.id));
+    expect(state.packages?.[0].installedVersion).toBe(project.packages[0].version);
+    expect(loading).toBe(false);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+  });
+
+  test('category transitions reuse warmed installed summaries and previously loaded tab results', () => {
+    const project = getMockCurrentProject();
+    const source = getMockPackageSource();
+    const apiPackages = getMockApiPackages().slice(0, 2);
+    nugetApiServiceMock.search.mockReturnValue(of(apiPackages));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    service.changeCurrentProject(project);
+
+    service.queryForPackages('', false, source);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+    expect(nugetApiServiceMock.search).toHaveBeenCalledTimes(1);
+
+    service.changeCurrentCategory(Category.Installed);
+    service.queryForPackages('', false, source, false);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+    expect(nugetApiServiceMock.clearPackageCache).not.toHaveBeenCalled();
+
+    service.changeCurrentCategory(Category.Browse);
+    service.queryForPackages('', false, source, false);
+    service.changeCurrentCategory(Category.Installed);
+    service.queryForPackages('', false, source, false);
+
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+    expect(nugetApiServiceMock.search).toHaveBeenCalledTimes(1);
+  });
+
+  test('Updates warm-up retains prerelease summaries for installed packages without available updates', () => {
+    const project = getMockCurrentProject();
+    project.packages = [
+      { id: 'Package1', version: '0.9.0', packageLevel: 'direct' },
+      { id: 'Package2', version: '2.0.0', packageLevel: 'direct' },
+    ];
+    const source = getMockPackageSource();
+    const apiPackages = getMockApiPackages().slice(0, 2).map((packageRow, index) => ({
+      ...packageRow,
+      version: index === 0 ? '1.0.0' : '2.0.0',
+      description: `prerelease metadata ${index}`,
+      iconUrl: `https://example.test/icon-${index}.png`,
+    }));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Updates);
+
+    service.queryForPackages('', true, source);
+
+    let updateIds: string[] | undefined;
+    service.currentPackages.pipe(take(1)).subscribe((packages) => {
+      updateIds = packages?.map((packageRow) => packageRow.id);
+    });
+    expect(updateIds).toEqual(['Package1']);
+
+    service.changeCurrentCategory(Category.Installed);
+    service.queryForPackages('', true, source, false);
+
+    const installedState: { packages: PackageRowModel[] | null } = { packages: null };
+    service.currentPackages.pipe(take(1)).subscribe((packages) => {
+      installedState.packages = packages;
+    });
+    expect(installedState.packages?.map((packageRow) => packageRow.id)).toEqual(['Package1', 'Package2']);
+    expect(installedState.packages?.map((packageRow) => packageRow.iconUrl)).toEqual([
+      'https://example.test/icon-0.png',
+      'https://example.test/icon-1.png',
+    ]);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+  });
+
+  test('Updates filter prerelease-warmed summaries to newer versions and keep the count consistent', () => {
+    const project = getMockCurrentProject();
+    project.packages = [
+      { id: 'Package1', version: '0.9.0', packageLevel: 'direct' },
+      { id: 'Package2', version: '2.0.0', packageLevel: 'direct' },
+    ];
+    const source = getMockPackageSource();
+    const apiPackages = getMockApiPackages().slice(0, 2).map((packageRow, index) => ({
+      ...packageRow,
+      version: index === 0 ? '1.0.0-rc.1' : '2.0.0',
+      iconUrl: `https://example.test/icon-${index}.png`,
+    }));
+    nugetApiServiceMock.search.mockReturnValue(of(apiPackages));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((value) => (updateCount = value));
+    service.changeCurrentProject(project);
+
+    service.queryForPackages('', true, source);
+    service.changeCurrentCategory(Category.Updates);
+    service.queryForPackages('', true, source, false);
+
+    expect(state.packages?.map((packageRow) => packageRow.id)).toEqual(['Package1']);
+    expect(state.packages?.[0].version).toBe('1.0.0-rc.1');
+    expect(updateCount).toEqual({ count: 1, loading: false });
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+  });
+
+  test('Updates show no packages when prerelease-warmed summaries contain no newer versions', () => {
+    const project = getMockCurrentProject();
+    project.packages = [
+      { id: 'Package1', version: '1.0.0-rc.1', packageLevel: 'direct' },
+      { id: 'Package2', version: '2.0.0', packageLevel: 'direct' },
+    ];
+    const source = getMockPackageSource();
+    const apiPackages = getMockApiPackages().slice(0, 2).map((packageRow, index) => ({
+      ...packageRow,
+      version: index === 0 ? '1.0.0-rc.1' : '2.0.0',
+    }));
+    nugetApiServiceMock.search.mockReturnValue(of(apiPackages));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((value) => (updateCount = value));
+    service.changeCurrentProject(project);
+
+    service.queryForPackages('', true, source);
+    service.changeCurrentCategory(Category.Updates);
+    service.queryForPackages('', true, source, false);
+
+    expect(state.packages).toEqual([]);
+    expect(updateCount).toEqual({ count: 0, loading: false });
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+  });
+
+  test('manual refresh clears cached tab results and package summaries', () => {
+    const project = getMockCurrentProject();
+    const source = getMockPackageSource();
+    const apiPackages = getMockApiPackages().slice(0, 2);
+    nugetApiServiceMock.search.mockReturnValue(of(apiPackages));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(apiPackages));
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Installed);
+
+    service.queryForPackages('', false, source, false);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(1);
+
+    service.queryForPackages('', false, source, true, true);
+
+    expect(nugetApiServiceMock.clearPackageCache).toHaveBeenCalledWith(source);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(2);
+  });
+
+  test('changed project inventory invalidates cached tab results and reuses refreshed summaries', () => {
+    const firstProject = getMockCurrentProject();
+    const secondProject = getMockCurrentProject();
+    secondProject.packages = [{ id: 'Package3', version: '2.0.0', packageLevel: 'direct' }];
+    const source = getMockPackageSource();
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(getMockApiPackages()));
+    service.changeCurrentProject(firstProject);
+    service.changeCurrentCategory(Category.Installed);
+    service.queryForPackages('', false, source, false);
+
+    service.changeCurrentProject(secondProject);
+    service.queryForPackages('', false, source, false);
+
+    let packageIds: string[] | undefined;
+    service.currentPackages.pipe(take(1)).subscribe((packages) => {
+      packageIds = packages?.map((packageRow) => packageRow.id);
+    });
+    expect(packageIds).toEqual(['Package3']);
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(2);
+  });
+
+  test('installed prerelease-only summaries add icons without changing installed versions or update counts', () => {
+    const project = getMockCurrentProject();
+    const prereleaseOnlySummary = { ...getMockApiPackages()[0], version: '', iconUrl: 'https://example.test/icon.png' };
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((state) => (updateCount = state));
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Installed);
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(of([prereleaseOnlySummary]));
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    const installedPackage = state.packages?.find((packageRow) => packageRow.id === prereleaseOnlySummary.id);
+    expect(installedPackage).toMatchObject({
+      version: project.packages[0].version,
+      installedVersion: project.packages[0].version,
+      iconUrl: 'https://example.test/icon.png',
+      isInstalled: true,
+      isOutdated: false,
+    });
+    expect(updateCount).toEqual({ count: 0, loading: false });
+  });
+
   test('updates query only direct package ids and excludes transitive-only updates', (done) => {
     const solution = getMockSolution();
     solution.projects[0].packages = [
@@ -121,15 +346,186 @@ describe('PackageManagerService', () => {
     service.currentPackages.pipe(skip(2), take(1)).subscribe((packages) => {
       expect(packages?.map((packageRow) => packageRow.id)).toEqual(['Package1']);
       expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenLastCalledWith(
-        ['Package1'],
+        ['Package1', 'Package3'],
         '',
         false,
-        getMockPackageSource()
+        getMockPackageSource(),
+        false
       );
       done();
     });
 
     service.queryForPackages('', false, getMockPackageSource());
+  });
+
+  test.each([
+    ['11.0.0-rc.2', '10.0.13', 0],
+    ['11.0.0-rc.2', '11.0.0', 1],
+    ['10.0.13', '11.0.0', 1],
+  ])(
+    'updates compare versions instead of treating every mismatch as an update (%s installed, %s available)',
+    (installedVersion: string, availableVersion: string, expectedUpdateCount: number) => {
+      const project = getMockCurrentProject();
+      const packageId = getMockApiPackages()[0].id;
+      project.packages = [{ id: packageId, version: installedVersion, packageLevel: 'direct' }];
+      const availablePackage = { ...getMockApiPackages()[0], version: availableVersion };
+      const state: { packages: PackageRowModel[] | null } = { packages: null };
+      let updateCount = { count: null as number | null, loading: false };
+      service.currentPackages.subscribe((packages) => (state.packages = packages));
+      service.availableUpdateCount.subscribe((value) => (updateCount = value));
+      nugetApiServiceMock.searchByPackageIds.mockReturnValue(of([availablePackage]));
+      service.changeCurrentProject(project);
+      service.changeCurrentCategory(Category.Updates);
+
+      service.queryForPackages('', false, getMockPackageSource());
+
+      expect(state.packages?.map((packageRow) => packageRow.id)).toEqual(expectedUpdateCount ? [packageId] : []);
+      expect(updateCount).toEqual({ count: expectedUpdateCount, loading: false });
+    }
+  );
+
+  test('exact requested versions suppress updates outside the pin', () => {
+    const packageId = getMockApiPackages()[0].id;
+    const project = getMockCurrentProject();
+    project.packages = [getPackageWithRequestedVersion(packageId, '7.0.0', '[7.0.0]')];
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((value) => (updateCount = value));
+    nugetApiServiceMock.searchByPackageIds
+      .mockReturnValueOnce(of([{ ...getMockApiPackages()[0], version: '9.0.0' }]))
+      .mockReturnValueOnce(of([{ ...getMockApiPackages()[0], version: '9.0.0', versions: [getMockCatalogEntry(packageId, '9.0.0')] }]));
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Updates);
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    expect(state.packages).toEqual([]);
+    expect(updateCount).toEqual({ count: 0, loading: false });
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledTimes(2);
+  });
+
+  test('bounded requested versions select the newest available version within the range', () => {
+    const packageId = getMockApiPackages()[0].id;
+    const project = getMockCurrentProject();
+    project.packages = [getPackageWithRequestedVersion(packageId, '7.0.0', '[7.0.0, 8.0.0)')];
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((value) => (updateCount = value));
+    nugetApiServiceMock.searchByPackageIds
+      .mockReturnValueOnce(of([{ ...getMockApiPackages()[0], version: '9.0.0' }]))
+      .mockReturnValueOnce(
+        of([
+          {
+            ...getMockApiPackages()[0],
+            version: '9.0.0',
+            versions: ['9.0.0', '7.9.0', '7.0.0'].map((version) => getMockCatalogEntry(packageId, version)),
+          },
+        ])
+      );
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Updates);
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    expect(state.packages?.map((packageRow) => [packageRow.id, packageRow.version])).toEqual([[packageId, '7.9.0']]);
+    expect(updateCount).toEqual({ count: 1, loading: false });
+  });
+
+  test('bounded requested versions suppress updates when no newer version fits the range', () => {
+    const packageId = getMockApiPackages()[0].id;
+    const project = getMockCurrentProject();
+    project.packages = [getPackageWithRequestedVersion(packageId, '7.5.0', '[7.0.0, 8.0.0)')];
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    let updateCount = { count: null as number | null, loading: false };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    service.availableUpdateCount.subscribe((value) => (updateCount = value));
+    nugetApiServiceMock.searchByPackageIds
+      .mockReturnValueOnce(of([{ ...getMockApiPackages()[0], version: '9.0.0' }]))
+      .mockReturnValueOnce(
+        of([
+          {
+            ...getMockApiPackages()[0],
+            version: '9.0.0',
+            versions: ['9.0.0', '7.5.0', '7.0.0'].map((version) => getMockCatalogEntry(packageId, version)),
+          },
+        ])
+      );
+    service.changeCurrentProject(project);
+    service.changeCurrentCategory(Category.Updates);
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    expect(state.packages).toEqual([]);
+    expect(updateCount).toEqual({ count: 0, loading: false });
+  });
+
+  test('solution updates only target projects whose requested version accepts the selected candidate', () => {
+    const packageId = getMockApiPackages()[0].id;
+    const solution = getMockSolution();
+    solution.projects[0].packages = [getPackageWithRequestedVersion(packageId, '7.0.0', '[7.0.0, 8.0.0)')];
+    solution.projects[1].packages = [getPackageWithRequestedVersion(packageId, '8.0.0', '[8.0.0, 9.0.0)')];
+    const state: { packages: PackageRowModel[] | null } = { packages: null };
+    service.currentPackages.subscribe((packages) => (state.packages = packages));
+    nugetApiServiceMock.searchByPackageIds
+      .mockReturnValueOnce(of([{ ...getMockApiPackages()[0], version: '9.0.0' }]))
+      .mockReturnValueOnce(
+        of([
+          {
+            ...getMockApiPackages()[0],
+            version: '9.0.0',
+            versions: ['9.0.0', '8.5.0', '7.9.0', '7.0.0'].map((version) => getMockCatalogEntry(packageId, version)),
+          },
+        ])
+      );
+    service.changeCurrentSolution(solution);
+    service.changeCurrentCategory(Category.Updates);
+
+    service.queryForPackages('', false, getMockPackageSource());
+
+    expect(state.packages?.map((packageRow) => [packageRow.id, packageRow.version])).toEqual([[packageId, '8.5.0']]);
+    service.installPackages(state.packages ?? []);
+
+    expect(vscodeServiceMock.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: 'update-packages-batch',
+        updates: [
+          expect.objectContaining({
+            packageId,
+            packageVersion: '8.5.0',
+            projectPaths: [solution.projects[1].fsPath],
+          }),
+        ],
+      })
+    );
+  });
+
+  test('initial browse load primes summaries for all installed packages and keeps startup loading visible', () => {
+    const project = getMockCurrentProject();
+    project.packages[1].packageLevel = 'transitive';
+    const source = getMockPackageSource();
+    const summaryRequest = new Subject<PackageRowModel[]>();
+    nugetApiServiceMock.search.mockReturnValue(of([]));
+    nugetApiServiceMock.searchByPackageIds.mockReturnValue(summaryRequest);
+    service.changeCurrentProject(project);
+
+    let contextLoading: string | null = null;
+    service.contextLoading.subscribe((state) => (contextLoading = state?.message ?? null));
+    service.queryForPackages('', false, source);
+
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledWith(
+      project.packages.map((installedPackage) => installedPackage.id),
+      '',
+      false,
+      source,
+      false
+    );
+    expect(contextLoading).toBe('Loading installed package information from the selected source...');
+
+    summaryRequest.next(getMockApiPackages());
+
+    expect(contextLoading).toBeNull();
   });
 
   test('consolidation filters to differing direct versions and ignores transitive-only or matching versions', () => {
@@ -165,11 +561,12 @@ describe('PackageManagerService', () => {
       expect(packages?.map((packageRow) => packageRow.id)).toEqual(['Package1', 'Package7']);
     });
     expect(service.consolidationCount).toBe(2);
-    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenLastCalledWith(
-      ['package1', 'Package2', 'Package3', 'Package5', 'Package6', 'Package7'],
+    expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledWith(
+      ['package1', 'Package2', 'Package3', 'Package4', 'Package5', 'Package6', 'Package7'],
       '',
       false,
-      getMockPackageSource()
+      getMockPackageSource(),
+      false
     );
   });
 
@@ -205,13 +602,15 @@ describe('PackageManagerService', () => {
     nugetApiServiceMock.search.mockReturnValue(of([]));
     nugetApiServiceMock.searchByPackageIds.mockReturnValue(of(getMockApiPackages()));
     service.changeCurrentSolution(solution);
+    service.changeCurrentCategory(Category.Updates);
     service.availableUpdateCount.pipe(skip(2), take(1)).subscribe((state) => {
       expect(state).toEqual({ count: 1, loading: false });
       expect(nugetApiServiceMock.searchByPackageIds).toHaveBeenCalledWith(
-        ['Package1', 'Package2'],
+        ['Package1', 'Package3', 'Package2'],
         '',
         false,
-        getMockPackageSource()
+        getMockPackageSource(),
+        false
       );
       done();
     });
@@ -421,7 +820,7 @@ describe('PackageManagerService', () => {
     let errorMessage: string | null = null;
     service.currentPackagesError.subscribe((value) => (errorMessage = value));
 
-    service.queryForPackages('', false, source);
+    service.queryForPackages('p', false, source);
 
     expect(errorMessage).toBe('Packages could not be loaded from the selected source. Check the source settings or connection, then refresh.');
   });
@@ -531,7 +930,8 @@ describe('PackageManagerService', () => {
           ['Package1', 'Package2'],
           '',
           prerelease,
-          source
+          source,
+          false
         );
         done();
       } catch (error) {
@@ -564,9 +964,12 @@ describe('PackageManagerService', () => {
       service.changeCurrentCategory(category);
 
       // remove the third package for a realistic test scenario
-      const expectedPackagesFromApi: PackageRowModel[] = getMockApiPackages().slice(0, 2);
+      const expectedPackagesFromApi: PackageRowModel[] = getMockApiPackages()
+        .slice(0, 2)
+        .map((packageRow) => ({ ...packageRow, description: 'test package description' }));
 
-      service.currentPackages.pipe(skip(2)).subscribe((packages: PackageRowModel[] | null) => {
+      const emissionToCheck = 2;
+      service.currentPackages.pipe(skip(emissionToCheck)).subscribe((packages: PackageRowModel[] | null) => {
         try {
           expect(packages).not.toBeNull();
           expect(packages?.length).toBe(expectedResultCount);
@@ -620,6 +1023,18 @@ describe('PackageManagerService', () => {
       packageSourceUrl: packageToInstall.sourceUrl,
     }));
     expect(vscodeServiceMock.postMessage.mock.calls[0][0].operationId).toEqual(expect.any(String));
+  });
+
+  test('installPackage does not apply an explicit version outside the installed package range', () => {
+    const packageToInstall = { ...getMockApiPackages()[0], version: '9.0.0' };
+    const currentProject = getMockCurrentProject();
+    currentProject.packages = [getPackageWithRequestedVersion(packageToInstall.id, '7.0.0', '[7.0.0]')];
+    service.changeCurrentProject(currentProject);
+    vscodeServiceMock.postMessage.mockClear();
+
+    service.installPackage(packageToInstall, '9.0.0');
+
+    expect(vscodeServiceMock.postMessage).not.toHaveBeenCalled();
   });
 
   test('installPackage should call postMessage with correct version', () => {
@@ -884,5 +1299,32 @@ function getFrameworkSpecificPackage(id: string, versions: string[]): InstalledP
       versionSource: 'central',
       packageLevel: 'direct',
     })),
+  };
+}
+
+function getPackageWithRequestedVersion(id: string, version: string, requestedVersion: string): InstalledPackage {
+  return {
+    id,
+    version,
+    packageLevel: 'direct',
+    targetFrameworkVersions: [
+      {
+        targetFramework: 'net8.0',
+        version,
+        requestedVersion,
+        versionSource: 'central',
+        packageLevel: 'direct',
+      },
+    ],
+  };
+}
+
+function getMockCatalogEntry(id: string, version: string): CatalogEntry {
+  return {
+    '@id': `https://example.test/${id}/${version}`,
+    id,
+    version,
+    dependencyGroups: undefined,
+    listed: true,
   };
 }

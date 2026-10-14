@@ -37,7 +37,7 @@ describe('ToolBarComponent', () => {
     });
 
     expect(packageManagerMock.currentCategory.value).toBe(Category.Updates);
-    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, source);
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, source, true, false);
     expect(packageManagerMock.queryForPackages).toHaveBeenCalledTimes(3);
 
     component.ngOnDestroy();
@@ -54,7 +54,7 @@ describe('ToolBarComponent', () => {
     component.searchForm?.patchValue({ query: 'Widget', prerelease: true, source });
     component.refresh();
 
-    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('Widget', true, source);
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('Widget', true, source, true, false);
     component.ngOnDestroy();
   });
 
@@ -64,7 +64,7 @@ describe('ToolBarComponent', () => {
     component.refresh();
 
     expect(component.packageSources).toEqual([NUGET_ORG]);
-    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, NUGET_ORG);
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, NUGET_ORG, true, false);
     component.ngOnDestroy();
   });
 
@@ -85,7 +85,27 @@ describe('ToolBarComponent', () => {
     component.refresh();
 
     expect(component.packageSources).toEqual([updatedSource]);
-    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, updatedSource);
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, updatedSource, true, false);
+    component.ngOnDestroy();
+  });
+
+  test('does not force refresh when the user changes package tabs', () => {
+    const source: PackageSource = { name: 'Test feed', url: 'https://example.test/v3/index.json', authorizationHeader: undefined };
+    const { component, packageManagerMock } = createToolbar([source]);
+
+    packageManagerMock.currentCategory.next(Category.Installed);
+
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, source, false, false);
+    component.ngOnDestroy();
+  });
+
+  test('explicit refresh bypasses cached package results and feed metadata', () => {
+    const source: PackageSource = { name: 'Test feed', url: 'https://example.test/v3/index.json', authorizationHeader: undefined };
+    const { component, packageManagerMock } = createToolbar([source]);
+
+    component.refresh(true, true);
+
+    expect(packageManagerMock.queryForPackages).toHaveBeenLastCalledWith('', false, source, true, true);
     component.ngOnDestroy();
   });
 });

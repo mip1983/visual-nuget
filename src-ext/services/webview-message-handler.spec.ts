@@ -492,6 +492,107 @@ describe('WebviewMessageHandler package update batches', () => {
     expect(task.taskExecution.args).not.toContain('--interactive');
   });
 
+  test('loads project context through the fast package inventory path', async () => {
+    const project: Project = {
+      name: 'Batch',
+      fsPath: projectPath,
+      packages: [],
+      packageMetadataComplete: false,
+    };
+    const loadProjectInventoryAsync = jest.fn().mockResolvedValue(project);
+    const loadProjectAsync = jest.fn();
+    const internals = handler as unknown as {
+      projectFileLoader: {
+        loadProjectInventoryAsync: typeof loadProjectInventoryAsync;
+        loadProjectAsync: typeof loadProjectAsync;
+      };
+      loadContext: () => void;
+    };
+    internals.projectFileLoader = { loadProjectInventoryAsync, loadProjectAsync };
+
+    (internals.loadContext as jest.Mock).mockRestore();
+    internals.loadContext();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(loadProjectInventoryAsync).toHaveBeenCalledWith(projectPath);
+    expect(loadProjectAsync).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({ type: 'project', data: project });
+  });
+
+  test('loads CPM metadata before adding to a fast-loaded project inventory', async () => {
+    const initialProject = {
+      name: 'Batch',
+      fsPath: projectPath,
+      packages: [],
+      packageMetadataComplete: false,
+    };
+    const metadataProject = {
+      ...initialProject,
+      managePackageVersionsCentrally: true,
+      packageMetadataComplete: true,
+    };
+    const loadProjectAsync = jest.fn().mockResolvedValue(metadataProject);
+    const internals = handler as unknown as {
+      projectFileLoader: { loadProjectAsync: typeof loadProjectAsync };
+      solutionProjects: Map<string, Project>;
+    };
+    internals.projectFileLoader = { loadProjectAsync };
+    internals.solutionProjects.set(projectPath, initialProject);
+
+    const operationId = 'fast-inventory-cpm-install';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'add-package',
+      operationId,
+      projectName: projectPath,
+      packageId: 'Package.Cpm',
+      packageVersion: '2.0.0',
+      packageSourceUrl: 'https://packages.example/v3/index.json',
+    } as InstallMessage);
+    await completed;
+
+    expect(loadProjectAsync).toHaveBeenCalledWith(projectPath);
+    expect(messages).toContainEqual({ type: 'project', data: metadataProject });
+    const task = (vscode.tasks.executeTask as jest.Mock).mock.calls[0][0] as {
+      taskExecution: { args: Array<string | { value: string; quoting: number }> };
+    };
+    expect(task.taskExecution.args.slice(0, 2)).toEqual(['package', 'add']);
+  });
+
+  test('does not edit a project when required metadata cannot be loaded', async () => {
+    const initialProject = {
+      name: 'Batch',
+      fsPath: projectPath,
+      packages: [],
+      packageMetadataComplete: false,
+    };
+    const loadProjectAsync = jest.fn().mockRejectedValue(new Error('MSBuild evaluation failed'));
+    const internals = handler as unknown as {
+      projectFileLoader: { loadProjectAsync: typeof loadProjectAsync };
+      solutionProjects: Map<string, Project>;
+    };
+    internals.projectFileLoader = { loadProjectAsync };
+    internals.solutionProjects.set(projectPath, initialProject);
+
+    const operationId = 'fast-inventory-metadata-failure';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'add-package',
+      operationId,
+      projectName: projectPath,
+      packageId: 'Package.Cpm',
+      packageVersion: '2.0.0',
+      packageSourceUrl: 'https://packages.example/v3/index.json',
+    } as InstallMessage);
+    await completed;
+
+    expect(vscode.tasks.executeTask).not.toHaveBeenCalled();
+    expect(messages.filter((message) => message.type === 'operation-results').pop()).toMatchObject({
+      type: 'operation-results',
+      data: [expect.objectContaining({ succeeded: false, message: 'MSBuild evaluation failed' })],
+    });
+  });
+
   test('restores original files after build failure when the user requests rollback', async () => {
     const testHooks = vscode as unknown as { testHooks: { taskExitCodes: number[] } };
     testHooks.testHooks.taskExitCodes.push(0, 0, 1, 0);

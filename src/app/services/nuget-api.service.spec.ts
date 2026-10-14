@@ -105,6 +105,30 @@ describe('NuGetApiService', () => {
     await expect(result).resolves.toEqual([]);
   });
 
+  test('search_reusesCachedResultsUntilThePackageCacheIsCleared', async () => {
+    const firstRequest = firstValueFrom(service.search('widget', false, source));
+    http.expectOne(source.url).flush(apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']]));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'First result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await firstRequest;
+
+    await expect(firstValueFrom(service.search('widget', false, source))).resolves.toEqual([
+      expect.objectContaining({ version: '2.1.0' }),
+    ]);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+
+    service.clearPackageCache(source);
+
+    const refreshedRequest = firstValueFrom(service.search('widget', false, source));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '3.0.0', description: 'Refreshed result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await expect(refreshedRequest).resolves.toEqual([expect.objectContaining({ version: '3.0.0' })]);
+  });
+
   test('search_serviceIndexFailurePropagatesWithoutCallingSearchEndpoint', async () => {
     const result = firstValueFrom(service.search('widget', false, source));
     http.expectOne(source.url).flush({ message: 'Feed unavailable' }, { status: 503, statusText: 'Service Unavailable' });
@@ -164,6 +188,211 @@ describe('NuGetApiService', () => {
       deprecation: { reasons: ['Other'], message: 'Use Widget.Next instead.' },
       versions: [expect.objectContaining({ version: '1.2.0' }), expect.objectContaining({ version: '1.0.9' })],
     });
+  });
+
+  test('searchByPackageIds_canLoadPackageSummariesWithIconsWithoutRegistrationHistories', async () => {
+    const result = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([
+        ['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/'],
+        ['RegistrationsBaseUrl/Versioned', 'https://packages.example.test/v3/registration/'],
+      ])
+    );
+
+    const searchRequest = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(searchRequest.request.params.get('q')).toBe('packageid:Widget.Package');
+    expect(searchRequest.request.params.get('take')).toBe('1');
+    expect(searchRequest.request.headers.get('authorization')).toBe(source.authorizationHeader);
+    searchRequest.flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '2.1.0',
+          description: 'A widget package',
+          authors: ['Ada'],
+          iconUrl: 'https://packages.example.test/widget.png',
+          totalDownloads: 42,
+        },
+      ],
+    } satisfies SearchResults);
+
+    await expect(result).resolves.toEqual([
+      expect.objectContaining({
+        id: 'Widget.Package',
+        version: '2.1.0',
+        iconUrl: 'https://packages.example.test/widget.png',
+        versions: undefined,
+      }),
+    ]);
+    http.expectNone('https://packages.example.test/v3/registration/widget.package/index.json');
+  });
+
+  test('searchByPackageIds_reusesPackageSummariesAndTheFeedServiceIndex', async () => {
+    const summaryRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '2.1.0',
+          description: 'A widget package',
+          iconUrl: 'widget.png',
+          totalDownloads: undefined,
+        },
+      ],
+    } satisfies SearchResults);
+
+    await expect(summaryRequest).resolves.toEqual([expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' })]);
+
+    await expect(firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false))).resolves.toEqual([
+      expect.objectContaining({ id: 'Widget.Package', version: '2.1.0' }),
+    ]);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/search-versioned/');
+  });
+
+  test('clearPackageCache_forcesPackageSummariesToBeFetchedAgain', async () => {
+    const firstRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']]));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '2.1.0', description: 'First result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+    await firstRequest;
+
+    service.clearPackageCache(source);
+
+    const refreshedRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [{ id: 'Widget.Package', version: '3.0.0', description: 'Refreshed result', totalDownloads: undefined }],
+    } satisfies SearchResults);
+
+    await expect(refreshedRequest).resolves.toEqual([expect.objectContaining({ version: '3.0.0', description: 'Refreshed result' })]);
+  });
+
+  test('searchByPackageIds_doesNotShareCachedSummariesAcrossAuthorizationHeaders', async () => {
+    const firstRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    const firstIndex = http.expectOne(source.url);
+    expect(firstIndex.request.headers.get('authorization')).toBe(source.authorizationHeader);
+    firstIndex.flush(apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']]));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '2.1.0',
+          description: 'A widget package',
+          iconUrl: 'widget.png',
+          totalDownloads: undefined,
+        },
+      ],
+    } satisfies SearchResults);
+    await firstRequest;
+
+    const otherSource = { ...source, authorizationHeader: 'Bearer another-user' };
+    const secondRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, otherSource, false));
+    const secondIndex = http.expectOne(source.url);
+    expect(secondIndex.request.headers.get('authorization')).toBe(otherSource.authorizationHeader);
+    secondIndex.flush(apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']]));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '3.0.0',
+          description: 'A widget package',
+          iconUrl: 'widget.png',
+          totalDownloads: undefined,
+        },
+      ],
+    } satisfies SearchResults);
+
+    await expect(secondRequest).resolves.toEqual([expect.objectContaining({ version: '3.0.0' })]);
+  });
+
+  test('searchByPackageIds_retriesAfterSummaryRequestFailure', async () => {
+    const failedRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush(
+      { message: 'Search failed' },
+      { status: 503, statusText: 'Service Unavailable' }
+    );
+    await expect(failedRequest).rejects.toMatchObject({ status: 503 });
+
+    const retryRequest = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/').flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '2.1.0',
+          description: 'A widget package',
+          iconUrl: 'widget.png',
+          totalDownloads: undefined,
+        },
+      ],
+    } satisfies SearchResults);
+    await expect(retryRequest).resolves.toEqual([expect.objectContaining({ version: '2.1.0' })]);
+    http.expectNone(source.url);
+  });
+
+  test('searchByPackageIds_returnsPrereleaseOnlyIconWithoutUsingItAsAStableVersion', async () => {
+    const result = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(
+      apiIndex([['SearchQueryService/Versioned', 'https://packages.example.test/v3/search-versioned/']])
+    );
+
+    const stableSearch = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(stableSearch.request.params.get('prerelease')).toBe('false');
+    stableSearch.flush({ totalHits: 0, data: [] } satisfies SearchResults);
+
+    const prereleaseSearch = http.expectOne((request) => request.url === 'https://packages.example.test/v3/search-versioned/');
+    expect(prereleaseSearch.request.params.get('prerelease')).toBe('true');
+    prereleaseSearch.flush({
+      totalHits: 1,
+      data: [
+        {
+          id: 'Widget.Package',
+          version: '2.1.0-beta.1',
+          description: 'A prerelease-only package',
+          iconUrl: 'https://packages.example.test/widget.png',
+          totalDownloads: undefined,
+        },
+      ],
+    } satisfies SearchResults);
+
+    await expect(result).resolves.toEqual([
+      expect.objectContaining({
+        id: 'Widget.Package',
+        version: '',
+        iconUrl: 'https://packages.example.test/widget.png',
+      }),
+    ]);
+    http.expectNone(source.url);
+    http.expectNone('https://packages.example.test/v3/registration/widget.package/index.json');
+  });
+
+  test('searchByPackageIds_fallsBackToRegistrationWhenSearchIsUnavailable', async () => {
+    const result = firstValueFrom(service.searchByPackageIds(['Widget.Package'], '', false, source, false));
+    http.expectOne(source.url).flush(registrationIndex());
+
+    const registrationRequest = http.expectOne('https://packages.example.test/v3/registration/widget.package/index.json');
+    registrationRequest.flush(registration([catalogEntry('2.1.0', { iconUrl: 'https://packages.example.test/widget.png' })]));
+
+    await expect(result).resolves.toEqual([
+      expect.objectContaining({
+        id: 'Widget.Package',
+        iconUrl: 'https://packages.example.test/widget.png',
+        versions: expect.arrayContaining([expect.objectContaining({ version: '2.1.0' })]),
+      }),
+    ]);
   });
 
   test('searchByPackageIds_fetchesPagedRegistrationWithAuthorization', async () => {
@@ -236,6 +465,22 @@ describe('NuGetApiService', () => {
     await expect(result).resolves.toEqual([]);
   });
 
+  test('searchByPackageIds_limitsConcurrentPackageMetadataRequests', async () => {
+    const packageIds = Array.from({ length: 9 }, (_, index) => `Package${index}`);
+    const result = firstValueFrom(service.searchByPackageIds(packageIds, '', false, source));
+    http.expectOne(source.url).flush(registrationIndex());
+
+    const firstBatch = http.match((request) => request.url.endsWith('/index.json'));
+    expect(firstBatch).toHaveLength(8);
+    firstBatch.forEach((request) => request.flush({ count: 0, items: [] } satisfies PackageMetaResponse));
+
+    const finalBatch = http.match((request) => request.url.endsWith('/index.json'));
+    expect(finalBatch).toHaveLength(1);
+    finalBatch[0].flush({ count: 0, items: [] } satisfies PackageMetaResponse);
+
+    await expect(result).resolves.toEqual([]);
+  });
+
   test('searchByPackageIds_returnsEmptyForNoIdsOrEmptyRegistration', async () => {
     await expect(firstValueFrom(service.searchByPackageIds([], '', false, source))).resolves.toEqual([]);
     http.expectNone(source.url);
@@ -259,7 +504,6 @@ describe('NuGetApiService', () => {
     await expect(missingResult).resolves.toEqual([]);
 
     const failedResult = firstValueFrom(service.searchByPackageIds(['Unavailable.Package'], '', false, source));
-    http.expectOne(source.url).flush(registrationIndex());
     http.expectOne('https://packages.example.test/v3/registration/unavailable.package/index.json').flush(
       { message: 'Service unavailable' },
       { status: 503, statusText: 'Service Unavailable' }

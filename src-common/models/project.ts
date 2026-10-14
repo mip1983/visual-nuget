@@ -4,6 +4,7 @@ export type PackageLevel = 'direct' | 'transitive' | 'mixed' | 'unknown';
 export interface TargetFrameworkPackageVersion {
   targetFramework: string;
   version: string;
+  requestedVersion?: string;
   versionSource: PackageVersionSource;
   packageLevel?: 'direct' | 'transitive';
   condition?: string;
@@ -16,6 +17,7 @@ export interface Project {
   packages: InstalledPackage[];
   targetFrameworks?: string[];
   managePackageVersionsCentrally?: boolean;
+  packageMetadataComplete?: boolean;
   packageListWarning?: string;
 }
 
