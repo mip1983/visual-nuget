@@ -472,6 +472,767 @@ describe('WebviewMessageHandler package update batches', () => {
     ]);
   });
 
+  test('updates each shared central package version once and reports success for every project', async () => {
+    const projectPaths = ['CpmA.csproj', 'CpmB.csproj'].map((name) => path.join(temporaryDirectory, name));
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    const originalCentralFile = [
+      '<Project>',
+      '  <ItemGroup Label="Packages">',
+      '    <!-- Keep unrelated XML intact. -->',
+      '    <PackageVersion Include="Package.One" Version="1.0.0" />',
+      '    <PackageVersion Update=\'Package.Two\'>',
+      '      <Version>1.0.0</Version>',
+      '    </PackageVersion>',
+      '  </ItemGroup>',
+      '</Project>',
+      '',
+    ].join('\n');
+    await Promise.all([
+      ...projectPaths.map((projectPath) => fs.writeFile(projectPath, '<Project />')),
+      fs.writeFile(centralFilePath, originalCentralFile),
+    ]);
+    const projects: Project[] = projectPaths.map((projectPath) => ({
+      name: path.basename(projectPath),
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: ['Package.One', 'Package.Two'].map((id) => ({
+        id,
+        version: '1.0.0',
+        versionSource: 'central',
+        packageLevel: 'direct',
+        versionFilePath: centralFilePath,
+        targetFrameworkVersions: [
+          {
+            targetFramework: 'net8.0',
+            version: '1.0.0',
+            versionSource: 'central',
+            centralVersionDefinitionCount: 1,
+            packageLevel: 'direct',
+            versionFilePath: centralFilePath,
+          },
+        ],
+      })),
+    }));
+    configureSolutionHandler(path.join(temporaryDirectory, 'Cpm.sln'), projects);
+
+    const executeTaskMock = vscode.tasks.executeTask as jest.Mock;
+    const defaultTaskExecutor = executeTaskMock.getMockImplementation();
+    let centralFileContentsAtRestore: string | undefined;
+    executeTaskMock.mockImplementationOnce(async (task: { definition: { task: string } }) => {
+      if (task.definition.task === 'restore') {
+        centralFileContentsAtRestore = await fs.readFile(centralFilePath, 'utf8');
+      }
+      return defaultTaskExecutor?.(task);
+    });
+
+    const operationId = 'cpm-shared-version-updates';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: ['Package.One', 'Package.Two'].map((packageId) => ({
+        projectPaths,
+        packageId,
+        packageVersion: '2.0.0',
+        packageSourceUrl: 'https://packages.example/v3/index.json',
+      })),
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['restore']);
+    const updatedCentralFile = await fs.readFile(centralFilePath, 'utf8');
+    expect(updatedCentralFile).toBe(
+      originalCentralFile
+        .replace('Version="1.0.0"', 'Version="2.0.0"')
+        .replace('<Version>1.0.0</Version>', '<Version>2.0.0</Version>')
+    );
+    expect(centralFileContentsAtRestore).toBe(updatedCentralFile);
+
+    const operationResults = messages.filter((message) => message.type === 'operation-results').pop();
+    expect(operationResults?.type).toBe('operation-results');
+    if (operationResults?.type !== 'operation-results') {
+      throw new Error('The CPM batch should report each project result and the restore result.');
+    }
+    expect(operationResults.data.map((result) => [result.projectPath, result.packageId, result.succeeded])).toEqual([
+      [projectPaths[0], 'Package.One', true],
+      [projectPaths[1], 'Package.One', true],
+      [projectPaths[0], 'Package.Two', true],
+      [projectPaths[1], 'Package.Two', true],
+      [path.join(temporaryDirectory, 'Cpm.sln'), '(batch)', true],
+    ]);
+    expect(operationResults.data.slice(0, 4).map((result) => [result.fromVersion, result.toVersion])).toEqual([
+      ['1.0.0', '2.0.0'],
+      ['1.0.0', '2.0.0'],
+      ['1.0.0', '2.0.0'],
+      ['1.0.0', '2.0.0'],
+    ]);
+  });
+
+  test('rolls back bulk central version edits after restore failure', async () => {
+    const projectPath = path.join(temporaryDirectory, 'CpmRollback.csproj');
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    const originalCentralFile = '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="1.0.0" /></ItemGroup></Project>';
+    await Promise.all([fs.writeFile(projectPath, '<Project />'), fs.writeFile(centralFilePath, originalCentralFile)]);
+    const project: Project = {
+      name: 'CpmRollback.csproj',
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Cpm',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePath,
+          targetFrameworkVersions: [
+            {
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              centralVersionDefinitionCount: 1,
+              packageLevel: 'direct',
+              versionFilePath: centralFilePath,
+            },
+          ],
+        },
+      ],
+    };
+    configureSolutionHandler(path.join(temporaryDirectory, 'CpmRollback.sln'), [project]);
+
+    const testHooks = vscode as unknown as { testHooks: { taskExitCodes: number[] } };
+    testHooks.testHooks.taskExitCodes.push(1);
+    const operationId = 'cpm-rollback-after-restore-failure';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths: [projectPath],
+          packageId: 'Package.Cpm',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const batchResults = messages.filter((message) => message.type === 'operation-results').pop();
+    expect(batchResults?.type).toBe('operation-results');
+    if (batchResults?.type !== 'operation-results' || !batchResults.rollbackId) {
+      throw new Error('A failed restore after a central edit should provide a rollback action.');
+    }
+    await expect(fs.readFile(centralFilePath, 'utf8')).resolves.toBe(
+      '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="2.0.0" /></ItemGroup></Project>'
+    );
+
+    const rollbackOperationId = 'cpm-rollback-operation';
+    const rollbackCompleted = waitForCompletion(rollbackOperationId);
+    receiveMessage?.({
+      command: 'rollback-package-update',
+      operationId: rollbackOperationId,
+      rollbackId: batchResults.rollbackId,
+    } as RollbackPackageUpdateMessage);
+    await rollbackCompleted;
+
+    await expect(fs.readFile(centralFilePath, 'utf8')).resolves.toBe(originalCentralFile);
+    const rollbackResults = messages.filter((message) => message.type === 'operation-results').pop();
+    expect(rollbackResults).toMatchObject({
+      type: 'operation-results',
+      data: [expect.objectContaining({ operation: 'rollback', succeeded: true })],
+    });
+  });
+
+  test('keeps CPM updates separate when projects use different central version files', async () => {
+    const projectPaths = ['CpmA.csproj', 'CpmB.csproj'].map((name) => path.join(temporaryDirectory, name));
+    const centralFilePaths = ['A.Directory.Packages.props', 'B.Directory.Packages.props'].map((name) =>
+      path.join(temporaryDirectory, name)
+    );
+    await Promise.all([
+      ...projectPaths.map((projectPath) => fs.writeFile(projectPath, '<Project />')),
+      ...centralFilePaths.map((filePath) =>
+        fs.writeFile(
+          filePath,
+          '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="1.0.0" /></ItemGroup></Project>'
+        )
+      ),
+    ]);
+    const projects: Project[] = projectPaths.map((projectPath, index) => ({
+      name: path.basename(projectPath),
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Cpm',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePaths[index],
+          targetFrameworkVersions: [
+            {
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              centralVersionDefinitionCount: 1,
+              packageLevel: 'direct',
+              versionFilePath: centralFilePaths[index],
+            },
+          ],
+        },
+      ],
+    }));
+    configureSolutionHandler(path.join(temporaryDirectory, 'SeparateCpm.sln'), projects);
+
+    const operationId = 'separate-central-files';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths,
+          packageId: 'Package.Cpm',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['restore']);
+    await expect(Promise.all(centralFilePaths.map((filePath) => fs.readFile(filePath, 'utf8')))).resolves.toEqual(
+      centralFilePaths.map((filePath) => '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="2.0.0" /></ItemGroup></Project>')
+    );
+  });
+
+  test('falls back without partially editing a props file containing an MSBuild version expression', async () => {
+    const projectPath = path.join(temporaryDirectory, 'CpmExpression.csproj');
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    const centralFile = [
+      '<Project><ItemGroup>',
+      '<PackageVersion Include="Package.Literal" Version="1.0.0" />',
+      '<PackageVersion Include="Package.Cpm" Version="$(CpmVersion)" />',
+      '</ItemGroup></Project>',
+    ].join('');
+    await Promise.all([fs.writeFile(projectPath, '<Project />'), fs.writeFile(centralFilePath, centralFile)]);
+    const project: Project = {
+      name: 'CpmExpression.csproj',
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: ['Package.Literal', 'Package.Cpm'].map((id) => ({
+        id,
+        version: '1.0.0',
+        versionSource: 'central' as const,
+        packageLevel: 'direct' as const,
+        versionFilePath: centralFilePath,
+        targetFrameworkVersions: [
+          {
+            targetFramework: 'net8.0',
+            version: '1.0.0',
+            versionSource: 'central' as const,
+            centralVersionDefinitionCount: 1,
+            packageLevel: 'direct' as const,
+            versionFilePath: centralFilePath,
+          },
+        ],
+      })),
+    };
+    configureSolutionHandler(path.join(temporaryDirectory, 'CpmExpression.sln'), [project]);
+
+    const operationId = 'cpm-expression-fallback';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: ['Package.Literal', 'Package.Cpm'].map((packageId) => ({
+        projectPaths: [projectPath],
+        packageId,
+        packageVersion: '2.0.0',
+        packageSourceUrl: 'https://packages.example/v3/index.json',
+      })),
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'add', 'restore']);
+    expect(executedTasks.slice(0, 2).every((task) => task.taskExecution.args.includes('--no-restore'))).toBe(true);
+    await expect(fs.readFile(centralFilePath, 'utf8')).resolves.toBe(centralFile);
+  });
+
+  test('falls back to CLI updates when MSBuild reports multiple central definitions', async () => {
+    const projectPath = path.join(temporaryDirectory, 'CpmDuplicateDefinitions.csproj');
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    const centralFile = '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="1.0.0" /></ItemGroup></Project>';
+    await Promise.all([fs.writeFile(projectPath, '<Project />'), fs.writeFile(centralFilePath, centralFile)]);
+    const project: Project = {
+      name: 'CpmDuplicateDefinitions.csproj',
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Cpm',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePath,
+          targetFrameworkVersions: [
+            {
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              centralVersionDefinitionCount: 2,
+              packageLevel: 'direct',
+              versionFilePath: centralFilePath,
+            },
+          ],
+        },
+      ],
+    };
+    configureSolutionHandler(path.join(temporaryDirectory, 'CpmDuplicateDefinitions.sln'), [project]);
+
+    const operationId = 'cpm-duplicate-definition-fallback';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths: [projectPath],
+          packageId: 'Package.Cpm',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'restore']);
+    expect(executedTasks[0].taskExecution.args).toContain('--no-restore');
+    await expect(fs.readFile(centralFilePath, 'utf8')).resolves.toBe(centralFile);
+  });
+
+  test('mixes an eligible CPM bulk edit with a CLI fallback before one restore', async () => {
+    const bulkProjectPath = path.join(temporaryDirectory, 'CpmBulk.csproj');
+    const fallbackProjectPath = path.join(temporaryDirectory, 'CpmFallback.csproj');
+    const bulkCentralFilePath = path.join(temporaryDirectory, 'Bulk.Directory.Packages.props');
+    const fallbackCentralFilePath = path.join(temporaryDirectory, 'Fallback.Directory.Packages.props');
+    const bulkCentralFile = '<Project><ItemGroup><PackageVersion Include="Package.Bulk" Version="1.0.0" /></ItemGroup></Project>';
+    const fallbackCentralFile = [
+      '<Project><ItemGroup>',
+      '<PackageVersion Include="Package.Fallback" Version="1.0.0" />',
+      '<PackageVersion Include="Package.Fallback" Version="1.1.0" />',
+      '</ItemGroup></Project>',
+    ].join('');
+    await Promise.all([
+      fs.writeFile(bulkProjectPath, '<Project />'),
+      fs.writeFile(fallbackProjectPath, '<Project />'),
+      fs.writeFile(bulkCentralFilePath, bulkCentralFile),
+      fs.writeFile(fallbackCentralFilePath, fallbackCentralFile),
+    ]);
+    const projects: Project[] = [
+      {
+        name: 'CpmBulk.csproj',
+        fsPath: bulkProjectPath,
+        managePackageVersionsCentrally: true,
+        packages: [
+          {
+            id: 'Package.Bulk',
+            version: '1.0.0',
+            versionSource: 'central',
+            packageLevel: 'direct',
+            versionFilePath: bulkCentralFilePath,
+            targetFrameworkVersions: [
+              {
+                targetFramework: 'net8.0',
+                version: '1.0.0',
+                versionSource: 'central',
+                centralVersionDefinitionCount: 1,
+                packageLevel: 'direct',
+                versionFilePath: bulkCentralFilePath,
+              },
+            ],
+          },
+        ],
+      },
+      {
+        name: 'CpmFallback.csproj',
+        fsPath: fallbackProjectPath,
+        managePackageVersionsCentrally: true,
+        packages: [
+          {
+            id: 'Package.Fallback',
+            version: '1.0.0',
+            versionSource: 'central',
+            packageLevel: 'direct',
+            versionFilePath: fallbackCentralFilePath,
+            targetFrameworkVersions: [
+              {
+                targetFramework: 'net8.0',
+                version: '1.0.0',
+                versionSource: 'central',
+                centralVersionDefinitionCount: 2,
+                packageLevel: 'direct',
+                versionFilePath: fallbackCentralFilePath,
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    configureSolutionHandler(path.join(temporaryDirectory, 'MixedCpm.sln'), projects);
+
+    const executeTaskMock = vscode.tasks.executeTask as jest.Mock;
+    const defaultTaskExecutor = executeTaskMock.getMockImplementation();
+    const executionOrder: string[] = [];
+    let fallbackContentsAtCliUpdate: string | undefined;
+    let bulkContentsAtRestore: string | undefined;
+    executeTaskMock
+      .mockImplementationOnce(async (task: { definition: { task: string } }) => {
+        executionOrder.push(task.definition.task);
+        if (task.definition.task === 'add') {
+          fallbackContentsAtCliUpdate = await fs.readFile(fallbackCentralFilePath, 'utf8');
+        }
+        return defaultTaskExecutor?.(task);
+      })
+      .mockImplementationOnce(async (task: { definition: { task: string } }) => {
+        executionOrder.push(task.definition.task);
+        if (task.definition.task === 'restore') {
+          bulkContentsAtRestore = await fs.readFile(bulkCentralFilePath, 'utf8');
+        }
+        return defaultTaskExecutor?.(task);
+      });
+
+    const operationId = 'mixed-cpm-bulk-and-fallback';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths: [bulkProjectPath],
+          packageId: 'Package.Bulk',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+        {
+          projectPaths: [fallbackProjectPath],
+          packageId: 'Package.Fallback',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'restore']);
+    expect(executionOrder).toEqual(['add', 'restore']);
+    expect(executedTasks[0]?.taskExecution.args).toContain('Package.Fallback');
+    expect(executedTasks[0]?.taskExecution.args).toContain('--no-restore');
+    expect(fallbackContentsAtCliUpdate).toBe(fallbackCentralFile);
+    await expect(fs.readFile(bulkCentralFilePath, 'utf8')).resolves.toBe(
+      '<Project><ItemGroup><PackageVersion Include="Package.Bulk" Version="2.0.0" /></ItemGroup></Project>'
+    );
+    expect(bulkContentsAtRestore).toBe(
+      '<Project><ItemGroup><PackageVersion Include="Package.Bulk" Version="2.0.0" /></ItemGroup></Project>'
+    );
+  });
+
+  test('does not overwrite a central file changed after the batch snapshot', async () => {
+    const projectPath = path.join(temporaryDirectory, 'CpmConcurrentChange.csproj');
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    const originalCentralFile = '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="1.0.0" /></ItemGroup></Project>';
+    const concurrentCentralFile =
+      '<Project><ItemGroup><PackageVersion Include="Package.Cpm" Version="3.0.0" /></ItemGroup></Project>';
+    await Promise.all([fs.writeFile(projectPath, '<Project />'), fs.writeFile(centralFilePath, originalCentralFile)]);
+    const project: Project = {
+      name: 'CpmConcurrentChange.csproj',
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Cpm',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePath,
+          targetFrameworkVersions: [
+            {
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              centralVersionDefinitionCount: 1,
+              packageLevel: 'direct',
+              versionFilePath: centralFilePath,
+            },
+          ],
+        },
+      ],
+    };
+    configureSolutionHandler(path.join(temporaryDirectory, 'CpmConcurrentChange.sln'), [project]);
+
+    const originalPostMessage = webview.postMessage.getMockImplementation();
+    const { writeFileSync } = jest.requireActual<typeof import('node:fs')>('node:fs');
+    let concurrentChangeWritten = false;
+    webview.postMessage.mockImplementation((message: ExtensionMessage) => {
+      if (message.type === 'operation-progress' && message.data.message.startsWith('Updating 1 central package version')) {
+        writeFileSync(centralFilePath, concurrentCentralFile);
+        concurrentChangeWritten = true;
+      }
+      return originalPostMessage?.(message);
+    });
+
+    const operationId = 'cpm-concurrent-file-change';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths: [projectPath],
+          packageId: 'Package.Cpm',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    expect(concurrentChangeWritten).toBe(true);
+    await expect(fs.readFile(centralFilePath, 'utf8')).resolves.toBe(concurrentCentralFile);
+    expect(vscode.tasks.executeTask).not.toHaveBeenCalled();
+    const operationResults = messages.filter((message) => message.type === 'operation-results').pop();
+    expect(operationResults).toMatchObject({
+      type: 'operation-results',
+      data: [
+        expect.objectContaining({
+          packageId: '(batch)',
+          succeeded: false,
+          message: expect.stringContaining('Central package version file changed during the update'),
+        }),
+      ],
+    });
+  });
+
+  test('keeps non-CPM updates per project', async () => {
+    const projectPaths = ['ProjectA.csproj', 'ProjectB.csproj'].map((name) => path.join(temporaryDirectory, name));
+    await Promise.all(projectPaths.map((projectPath) => fs.writeFile(projectPath, '<Project />')));
+    const projects: Project[] = projectPaths.map((projectPath) => ({
+      name: path.basename(projectPath),
+      fsPath: projectPath,
+      managePackageVersionsCentrally: false,
+      packages: [{ id: 'Package.Shared', version: '1.0.0', packageLevel: 'direct', versionFilePath: projectPath }],
+    }));
+    configureSolutionHandler(path.join(temporaryDirectory, 'NonCpm.sln'), projects);
+
+    const operationId = 'non-cpm-project-updates';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths,
+          packageId: 'Package.Shared',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'add', 'restore']);
+    expect(executedTasks.slice(0, 2).map((task) => task.taskExecution.args.slice(0, 2))).toEqual([
+      ['add', { value: projectPaths[0], quoting: vscode.ShellQuoting.Strong }],
+      ['add', { value: projectPaths[1], quoting: vscode.ShellQuoting.Strong }],
+    ]);
+  });
+
+  test('keeps explicitly selected conditional CPM exceptions as separate project updates', async () => {
+    const projectPaths = ['CpmA.csproj', 'CpmB.csproj'].map((name) => path.join(temporaryDirectory, name));
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    await Promise.all([...projectPaths.map((projectPath) => fs.writeFile(projectPath, '<Project />')), fs.writeFile(centralFilePath, '<Project />')]);
+    const projects: Project[] = projectPaths.map((projectPath, index) => ({
+      name: path.basename(projectPath),
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Conditional',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePath,
+          targetFrameworkVersions: [
+            {
+              targetFramework: index === 0 ? 'net8.0' : 'net9.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              packageLevel: 'direct',
+              condition: `'$(TargetFramework)' == 'net${index === 0 ? '8' : '9'}.0'`,
+              versionFilePath: centralFilePath,
+            },
+          ],
+        },
+      ],
+    }));
+    configureSolutionHandler(path.join(temporaryDirectory, 'ConditionalCpm.sln'), projects);
+
+    const operationId = 'conditional-cpm-updates';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths,
+          packageId: 'Package.Conditional',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+          includeCpmExceptions: true,
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'add', 'restore']);
+    expect(
+      executedTasks.slice(0, 2).map((task) => task.taskExecution.args.find(
+        (argument): argument is { value: string; quoting: number } =>
+          typeof argument !== 'string' && argument.value.endsWith('.csproj')
+      )?.value)
+    ).toEqual(projectPaths);
+  });
+
+  test('falls back to individual project updates when a shared CPM update fails', async () => {
+    const projectPaths = ['CpmA.csproj', 'CpmB.csproj'].map((name) => path.join(temporaryDirectory, name));
+    const centralFilePath = path.join(temporaryDirectory, 'Directory.Packages.props');
+    await Promise.all([...projectPaths.map((projectPath) => fs.writeFile(projectPath, '<Project />')), fs.writeFile(centralFilePath, '<Project />')]);
+    const projects: Project[] = projectPaths.map((projectPath) => ({
+      name: path.basename(projectPath),
+      fsPath: projectPath,
+      managePackageVersionsCentrally: true,
+      packages: [
+        {
+          id: 'Package.Cpm',
+          version: '1.0.0',
+          versionSource: 'central',
+          packageLevel: 'direct',
+          versionFilePath: centralFilePath,
+          targetFrameworkVersions: [
+            {
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              versionSource: 'central',
+              centralVersionDefinitionCount: 1,
+              packageLevel: 'direct',
+              versionFilePath: centralFilePath,
+            },
+          ],
+        },
+      ],
+    }));
+    configureSolutionHandler(path.join(temporaryDirectory, 'CpmFailure.sln'), projects);
+    const testHooks = vscode as unknown as { testHooks: { taskExitCodes: number[] } };
+    testHooks.testHooks.taskExitCodes.push(1, 0, 0);
+
+    const operationId = 'cpm-fallback-after-failure';
+    const completed = waitForCompletion(operationId);
+    receiveMessage?.({
+      command: 'update-packages-batch',
+      operationId,
+      buildAfterRestore: false,
+      updates: [
+        {
+          projectPaths,
+          packageId: 'Package.Cpm',
+          packageVersion: '2.0.0',
+          packageSourceUrl: 'https://packages.example/v3/index.json',
+        },
+      ],
+    } as UpdatePackagesMessage);
+    await completed;
+
+    const executedTasks = (vscode.tasks.executeTask as jest.Mock).mock.calls.map(
+      ([task]) =>
+        task as unknown as {
+          definition: { task: string };
+          taskExecution: { args: Array<string | { value: string; quoting: number }> };
+        }
+    );
+    expect(executedTasks.map((task) => task.definition.task)).toEqual(['add', 'add', 'restore']);
+    expect(executedTasks.slice(0, 2).map((task) => task.taskExecution.args.find(
+      (argument): argument is { value: string; quoting: number } =>
+        typeof argument !== 'string' && argument.value.endsWith('.csproj')
+    )?.value)).toEqual(projectPaths);
+    const operationResults = messages.filter((message) => message.type === 'operation-results').pop();
+    expect(operationResults?.type).toBe('operation-results');
+    if (operationResults?.type !== 'operation-results') {
+      throw new Error('The CPM fallback should report each project result.');
+    }
+    expect(operationResults.data.map((result) => [result.projectPath, result.succeeded])).toEqual([
+      [projectPaths[0], false],
+      [projectPaths[1], true],
+      [path.join(temporaryDirectory, 'CpmFailure.sln'), true],
+    ]);
+  });
+
   test('reports a failed single-package install without revealing an interactive terminal', async () => {
     const testHooks = vscode as unknown as { testHooks: { taskExitCodes: number[] } };
     testHooks.testHooks.taskExitCodes.push(1);

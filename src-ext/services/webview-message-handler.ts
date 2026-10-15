@@ -39,11 +39,335 @@ interface RollbackSnapshot {
   expected: Map<string, Buffer>;
 }
 
+interface XmlAttributeRange {
+  rawValue: string;
+  valueStart: number;
+  valueEnd: number;
+  quote: '"' | "'";
+}
+
+interface XmlElementRange {
+  name: string;
+  attributes: Map<string, XmlAttributeRange>;
+  parent?: XmlElementRange;
+  selfClosing: boolean;
+  contentStart: number;
+  contentEnd?: number;
+}
+
+interface CentralPackageVersionChange {
+  packageId: string;
+  version: string;
+}
+
 const maxConcurrentMetadataLoads = 2;
 const maxPendingCacheWriteTimings = 512;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function findXmlTagEnd(xml: string, start: number, trackInternalSubset = false): number | undefined {
+  let quote: '"' | "'" | undefined;
+  let internalSubsetDepth = 0;
+  for (let index = start; index < xml.length; index++) {
+    const character = xml[index];
+    if (quote) {
+      if (character === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (trackInternalSubset && character === '[') {
+      internalSubsetDepth++;
+    } else if (trackInternalSubset && character === ']') {
+      internalSubsetDepth = Math.max(0, internalSubsetDepth - 1);
+    } else if (character === '>' && internalSubsetDepth === 0) {
+      return index;
+    }
+  }
+  return undefined;
+}
+
+function readXmlAttributes(xml: string, start: number, end: number): Map<string, XmlAttributeRange> | undefined {
+  const attributes = new Map<string, XmlAttributeRange>();
+  let index = start;
+  while (index < end) {
+    while (index < end && /\s/.test(xml[index] ?? '')) {
+      index++;
+    }
+    if (index >= end || xml[index] === '/') {
+      break;
+    }
+
+    const nameStart = index;
+    while (index < end && !/[\s=/>]/.test(xml[index] ?? '')) {
+      index++;
+    }
+    if (index === nameStart) {
+      return undefined;
+    }
+    const name = xml.slice(nameStart, index).toLowerCase();
+    while (index < end && /\s/.test(xml[index] ?? '')) {
+      index++;
+    }
+    if (xml[index] !== '=') {
+      return undefined;
+    }
+    index++;
+    while (index < end && /\s/.test(xml[index] ?? '')) {
+      index++;
+    }
+
+    const quote = xml[index];
+    if (quote !== '"' && quote !== "'") {
+      return undefined;
+    }
+    const valueStart = ++index;
+    while (index < end && xml[index] !== quote) {
+      index++;
+    }
+    if (index >= end || attributes.has(name)) {
+      return undefined;
+    }
+    attributes.set(name, {
+      rawValue: xml.slice(valueStart, index),
+      valueStart,
+      valueEnd: index,
+      quote,
+    });
+    index++;
+  }
+  return attributes;
+}
+
+function scanXmlElements(xml: string): XmlElementRange[] | undefined {
+  const elements: XmlElementRange[] = [];
+  const stack: XmlElementRange[] = [];
+  let index = 0;
+
+  while (index < xml.length) {
+    const start = xml.indexOf('<', index);
+    if (start < 0) {
+      break;
+    }
+    if (xml.startsWith('<!--', start)) {
+      const commentEnd = xml.indexOf('-->', start + 4);
+      if (commentEnd < 0) {
+        return undefined;
+      }
+      index = commentEnd + 3;
+      continue;
+    }
+    if (xml.startsWith('<![CDATA[', start)) {
+      const cdataEnd = xml.indexOf(']]>', start + 9);
+      if (cdataEnd < 0) {
+        return undefined;
+      }
+      index = cdataEnd + 3;
+      continue;
+    }
+    if (xml.startsWith('<?', start)) {
+      const instructionEnd = xml.indexOf('?>', start + 2);
+      if (instructionEnd < 0) {
+        return undefined;
+      }
+      index = instructionEnd + 2;
+      continue;
+    }
+
+    const declaration = xml.startsWith('<!', start);
+    const end = findXmlTagEnd(xml, start + 1, declaration);
+    if (end === undefined) {
+      return undefined;
+    }
+    if (declaration) {
+      index = end + 1;
+      continue;
+    }
+
+    const closing = xml[start + 1] === '/';
+    let nameStart = start + (closing ? 2 : 1);
+    while (nameStart < end && /\s/.test(xml[nameStart] ?? '')) {
+      nameStart++;
+    }
+    let nameEnd = nameStart;
+    while (nameEnd < end && !/[\s/>]/.test(xml[nameEnd] ?? '')) {
+      nameEnd++;
+    }
+    if (nameEnd === nameStart) {
+      return undefined;
+    }
+    const name = xml.slice(nameStart, nameEnd);
+
+    if (closing) {
+      const element = stack.pop();
+      if (!element || element.name !== name) {
+        return undefined;
+      }
+      element.contentEnd = start;
+    } else {
+      const attributes = readXmlAttributes(xml, nameEnd, end);
+      if (!attributes) {
+        return undefined;
+      }
+      const selfClosing = xml.slice(nameEnd, end).trimEnd().endsWith('/');
+      const element: XmlElementRange = {
+        name,
+        attributes,
+        parent: stack.length ? stack[stack.length - 1] : undefined,
+        selfClosing,
+        contentStart: end + 1,
+        ...(selfClosing ? { contentEnd: end + 1 } : {}),
+      };
+      elements.push(element);
+      if (!selfClosing) {
+        stack.push(element);
+      }
+    }
+    index = end + 1;
+  }
+
+  return stack.length === 0 ? elements : undefined;
+}
+
+function decodeXmlEntities(value: string): string | undefined {
+  const entityPattern = /&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi;
+  if (value.replace(entityPattern, '').includes('&')) {
+    return undefined;
+  }
+  return value.replace(entityPattern, (_entity, name: string) => {
+    const normalized = name.toLowerCase();
+    if (normalized === 'amp') return '&';
+    if (normalized === 'lt') return '<';
+    if (normalized === 'gt') return '>';
+    if (normalized === 'quot') return '"';
+    if (normalized === 'apos') return "'";
+    const codePoint = normalized.startsWith('#x')
+      ? Number.parseInt(normalized.slice(2), 16)
+      : Number.parseInt(normalized.slice(1), 10);
+    try {
+      return String.fromCodePoint(codePoint);
+    } catch {
+      return '';
+    }
+  });
+}
+
+function isLiteralMsbuildValue(value: string): boolean {
+  return !/[$@%]\(/.test(value);
+}
+
+function escapeXmlAttribute(value: string, quote: '"' | "'"): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(quote === '"' ? /"/g : /'/g, quote === '"' ? '&quot;' : '&apos;');
+}
+
+function escapeXmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function updateCentralPackageVersions(xml: string, updates: CentralPackageVersionChange[]): string | undefined {
+  const elements = scanXmlElements(xml);
+  if (!elements || updates.length === 0) {
+    return undefined;
+  }
+
+  const replacements: Array<{ start: number; end: number; value: string }> = [];
+  const packageIds = new Set<string>();
+  for (const update of updates) {
+    const packageKey = update.packageId.toLowerCase();
+    if (packageIds.has(packageKey)) {
+      return undefined;
+    }
+    packageIds.add(packageKey);
+
+    const declarations = elements.filter((element) => {
+      if (element.name.toLowerCase() !== 'packageversion') {
+        return false;
+      }
+      const include = element.attributes.get('include');
+      const updateMetadata = element.attributes.get('update');
+      if (include && updateMetadata) {
+        return true;
+      }
+      const identity = include ?? updateMetadata;
+      return identity !== undefined && decodeXmlEntities(identity.rawValue)?.toLowerCase() === packageKey;
+    });
+    if (declarations.length !== 1) {
+      return undefined;
+    }
+
+    const declaration = declarations[0];
+    if (!declaration) {
+      return undefined;
+    }
+    let ancestor: XmlElementRange | undefined = declaration;
+    while (ancestor) {
+      if (ancestor.attributes.has('condition')) {
+        return undefined;
+      }
+      ancestor = ancestor.parent;
+    }
+
+    const versionAttribute = declaration.attributes.get('version');
+    if (versionAttribute) {
+      const decodedVersion = decodeXmlEntities(versionAttribute.rawValue);
+      if (decodedVersion === undefined || !isLiteralMsbuildValue(decodedVersion)) {
+        return undefined;
+      }
+      replacements.push({
+        start: versionAttribute.valueStart,
+        end: versionAttribute.valueEnd,
+        value: escapeXmlAttribute(update.version, versionAttribute.quote),
+      });
+      continue;
+    }
+
+    if (declaration.selfClosing || declaration.contentEnd === undefined) {
+      return undefined;
+    }
+    const versionElements = elements.filter(
+      (element) => element.parent === declaration && element.name.toLowerCase() === 'version'
+    );
+    if (versionElements.length !== 1) {
+      return undefined;
+    }
+    const versionElement = versionElements[0];
+    if (
+      !versionElement ||
+      versionElement.selfClosing ||
+      versionElement.contentEnd === undefined ||
+      versionElement.attributes.size > 0
+    ) {
+      return undefined;
+    }
+    const rawContent = xml.slice(versionElement.contentStart, versionElement.contentEnd);
+    if (rawContent.includes('<')) {
+      return undefined;
+    }
+    const leadingWhitespace = rawContent.match(/^\s*/)?.[0].length ?? 0;
+    const trailingWhitespace = rawContent.match(/\s*$/)?.[0].length ?? 0;
+    const literalVersion = decodeXmlEntities(rawContent.trim());
+    if (literalVersion === undefined || !isLiteralMsbuildValue(literalVersion)) {
+      return undefined;
+    }
+    replacements.push({
+      start: versionElement.contentStart + leadingWhitespace,
+      end: versionElement.contentEnd - trailingWhitespace,
+      value: escapeXmlText(update.version),
+    });
+  }
+
+  return replacements
+    .sort((left, right) => right.start - left.start)
+    .reduce((updatedXml, replacement) => {
+      return updatedXml.slice(0, replacement.start) + replacement.value + updatedXml.slice(replacement.end);
+    }, xml);
 }
 
 export default class WebviewMessageHandler {
@@ -421,25 +745,110 @@ export default class WebviewMessageHandler {
         originalSnapshots = await this.captureFileSnapshots(affectedFiles);
 
         await this.taskManager.executeBatch(async () => {
-          for (let index = 0; index < targets.length; index++) {
-            const target = targets[index];
+          const directlyUpdatedTargets = new Set<UpdateTarget>();
+          const centralFileGroups = this.groupCpmTargetsByVersionFile(targets);
+          for (let index = 0; index < centralFileGroups.length; index++) {
+            const fileGroup = centralFileGroups[index];
+            if (!fileGroup) {
+              continue;
+            }
+            const updates = this.getCentralPackageVersionChanges(fileGroup.targets);
+            const originalSnapshot = originalSnapshots?.get(path.resolve(fileGroup.filePath));
+            if (!updates || !originalSnapshot) {
+              continue;
+            }
+
+            const originalContents = originalSnapshot.toString('utf8');
+            const updatedContents = updateCentralPackageVersions(originalContents, updates);
+            if (updatedContents === undefined) {
+              continue;
+            }
+
             this.postOperationProgress(
               message.operationId,
-              `Updating ${target.update.packageId} (${index + 1} of ${targets.length})…`
+              `Updating ${updates.length} central package version${updates.length === 1 ? '' : 's'} in ${path.basename(fileGroup.filePath)} (${index + 1} of ${centralFileGroups.length})…`
+            );
+            const currentContents = await fs.readFile(fileGroup.filePath);
+            if (!currentContents.equals(originalSnapshot)) {
+              throw new Error(`Central package version file changed during the update: ${fileGroup.filePath}`);
+            }
+            attemptedUpdates += fileGroup.targets.length;
+            if (updatedContents !== originalContents) {
+              await fs.writeFile(fileGroup.filePath, updatedContents, 'utf8');
+            }
+            for (const target of fileGroup.targets) {
+              directlyUpdatedTargets.add(target);
+              results.push({
+                projectPath: target.projectPath,
+                packageId: target.update.packageId,
+                operation: 'add',
+                succeeded: true,
+                fromVersion: this.getInstalledPackageVersion(target.projectPath, target.update.packageId),
+                toVersion: target.update.packageVersion,
+              });
+            }
+          }
+
+          const updateGroups = this.groupUpdateTargetsByCentralPackage(
+            targets.filter((target) => !directlyUpdatedTargets.has(target))
+          );
+          for (let index = 0; index < updateGroups.length; index++) {
+            const group = updateGroups[index];
+            const target = group[0];
+            if (!target) {
+              continue;
+            }
+            this.postOperationProgress(
+              message.operationId,
+              group.length > 1
+                ? `Updating ${target.update.packageId} centrally for ${group.length} projects (${index + 1} of ${updateGroups.length})…`
+                : `Updating ${target.update.packageId} (${index + 1} of ${updateGroups.length})…`
             );
             attemptedUpdates++;
-            results.push(
-              await this.executePackageTask(
-                target.projectPath,
-                target.update.packageId,
-                'add',
-                this.createPackageAddArguments(target, true),
-                {
-                  fromVersion: this.getInstalledPackageVersion(target.projectPath, target.update.packageId),
-                  toVersion: target.update.packageVersion,
-                }
-              )
+            const result = await this.executePackageTask(
+              target.projectPath,
+              target.update.packageId,
+              'add',
+              this.createPackageAddArguments(target, true),
+              {
+                fromVersion: this.getInstalledPackageVersion(target.projectPath, target.update.packageId),
+                toVersion: target.update.packageVersion,
+              }
             );
+            if (result.succeeded) {
+              attemptedUpdates += group.length - 1;
+              results.push(
+                ...group.map((groupTarget) => ({
+                  ...result,
+                  projectPath: groupTarget.projectPath,
+                  fromVersion: this.getInstalledPackageVersion(groupTarget.projectPath, groupTarget.update.packageId),
+                }))
+              );
+            } else {
+              results.push({
+                ...result,
+                projectPath: target.projectPath,
+                fromVersion: this.getInstalledPackageVersion(target.projectPath, target.update.packageId),
+              });
+              for (const fallbackTarget of group.slice(1)) {
+                this.postOperationProgress(
+                  message.operationId,
+                  `Updating ${fallbackTarget.update.packageId} in ${fallbackTarget.project.name} after the central update failed…`
+                );
+                attemptedUpdates++;
+                const fallbackResult = await this.executePackageTask(
+                  fallbackTarget.projectPath,
+                  fallbackTarget.update.packageId,
+                  'add',
+                  this.createPackageAddArguments(fallbackTarget, true),
+                  {
+                    fromVersion: this.getInstalledPackageVersion(fallbackTarget.projectPath, fallbackTarget.update.packageId),
+                    toVersion: fallbackTarget.update.packageVersion,
+                  }
+                );
+                results.push(fallbackResult);
+              }
+            }
           }
 
           if (attemptedUpdates > 0 && originalSnapshots) {
@@ -600,6 +1009,104 @@ export default class WebviewMessageHandler {
       }
     }
     return targets;
+  }
+
+  private groupUpdateTargetsByCentralPackage(targets: UpdateTarget[]): UpdateTarget[][] {
+    const groups: UpdateTarget[][] = [];
+    const groupsByKey = new Map<string, UpdateTarget[]>();
+
+    for (const target of targets) {
+      const groupKey = this.getCentralPackageGroupKey(target);
+      if (groupKey === undefined) {
+        groups.push([target]);
+        continue;
+      }
+
+      const existingGroup = groupsByKey.get(groupKey);
+      if (existingGroup) {
+        existingGroup.push(target);
+      } else {
+        const group = [target];
+        groupsByKey.set(groupKey, group);
+        groups.push(group);
+      }
+    }
+
+    return groups;
+  }
+
+  private groupCpmTargetsByVersionFile(targets: UpdateTarget[]): Array<{ filePath: string; targets: UpdateTarget[] }> {
+    const groups = new Map<string, { filePath: string; targets: UpdateTarget[] }>();
+    for (const target of targets) {
+      const filePath = this.getCentralPackageVersionFilePath(target);
+      if (!filePath) {
+        continue;
+      }
+      const key = path.resolve(filePath).toLowerCase();
+      const group = groups.get(key);
+      if (group) {
+        group.targets.push(target);
+      } else {
+        groups.set(key, { filePath, targets: [target] });
+      }
+    }
+    return Array.from(groups.values());
+  }
+
+  private getCentralPackageVersionChanges(targets: UpdateTarget[]): CentralPackageVersionChange[] | undefined {
+    const changes = new Map<string, CentralPackageVersionChange>();
+    for (const target of targets) {
+      const key = target.update.packageId.toLowerCase();
+      const existingChange = changes.get(key);
+      if (existingChange && existingChange.version !== target.update.packageVersion) {
+        return undefined;
+      }
+      changes.set(key, { packageId: target.update.packageId, version: target.update.packageVersion });
+    }
+    return Array.from(changes.values());
+  }
+
+  private getCentralPackageVersionFilePath(target: UpdateTarget): string | undefined {
+    if (!target.project.managePackageVersionsCentrally) {
+      return undefined;
+    }
+
+    const installedPackage = target.project.packages.find(
+      (item) => item.id.toLowerCase() === target.update.packageId.toLowerCase()
+    );
+    if (
+      !installedPackage ||
+      installedPackage.versionSource !== 'central' ||
+      this.hasCpmVersionException(installedPackage) ||
+      !installedPackage.targetFrameworkVersions?.length ||
+      installedPackage.targetFrameworkVersions.some((item) => item.centralVersionDefinitionCount !== 1)
+    ) {
+      return undefined;
+    }
+
+    const centralVersionFiles = [
+      installedPackage.versionFilePath,
+      ...(installedPackage.targetFrameworkVersions ?? []).map((item) => item.versionFilePath),
+    ].filter((filePath): filePath is string => filePath !== undefined && filePath.length > 0);
+    const normalizedFiles = new Map(centralVersionFiles.map((filePath) => [path.resolve(filePath).toLowerCase(), filePath]));
+    return normalizedFiles.size === 1 ? Array.from(normalizedFiles.values())[0] : undefined;
+  }
+
+  private getCentralPackageGroupKey(target: UpdateTarget): string | undefined {
+    if (target.update.includeCpmExceptions) {
+      return undefined;
+    }
+    const centralVersionFilePath = this.getCentralPackageVersionFilePath(target);
+    if (!centralVersionFilePath) {
+      return undefined;
+    }
+
+    return JSON.stringify([
+      path.resolve(centralVersionFilePath).toLowerCase(),
+      target.update.packageId.toLowerCase(),
+      target.update.packageVersion,
+      target.update.packageSourceUrl,
+    ]);
   }
 
   private hasCpmVersionException(existingPackage: Project['packages'][number]): boolean {

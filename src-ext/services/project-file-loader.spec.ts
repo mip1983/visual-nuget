@@ -242,12 +242,14 @@ describe('ProjectFileLoader', () => {
               version: '10.0.12',
               requestedVersion: '10.0.12',
               versionSource: 'central',
+              centralVersionDefinitionCount: 1,
             }),
             expect.objectContaining({
               targetFramework: 'net10.0',
               version: '10.0.12',
               requestedVersion: '10.0.12',
               versionSource: 'central',
+              centralVersionDefinitionCount: 1,
             }),
           ]),
         }),
@@ -287,6 +289,50 @@ describe('ProjectFileLoader', () => {
     );
     expect(project.packageListWarning).toBeUndefined();
   }, 30_000);
+
+  it('preserves duplicate evaluated central package definitions as ambiguous metadata', async () => {
+    const projectPath = path.resolve('workspace', 'DuplicateCentral.csproj');
+    const centralFilePath = path.resolve('workspace', 'Directory.Packages.props');
+    const importedFilePath = path.resolve('workspace', 'ImportedVersions.props');
+    const evaluate = jest.fn().mockResolvedValue({
+      targetFramework: 'net8.0',
+      managePackageVersionsCentrally: true,
+      packageReferences: [{ identity: 'Duplicate.Package', definingProjectFullPath: projectPath }],
+      packageVersions: [
+        { identity: 'Duplicate.Package', version: '1.0.0', definingProjectFullPath: centralFilePath },
+        { identity: 'Duplicate.Package', version: '1.1.0', definingProjectFullPath: importedFilePath },
+      ],
+    });
+    const listPackages = jest.fn().mockResolvedValue(
+      JSON.stringify({
+        version: 1,
+        projects: [
+          {
+            path: projectPath,
+            frameworks: [{ framework: 'net8.0', topLevelPackages: [{ id: 'Duplicate.Package', resolvedVersion: '1.0.0' }] }],
+          },
+        ],
+      })
+    );
+
+    const project = await new ProjectFileLoader(evaluate, listPackages).loadProjectAsync(projectPath);
+
+    expect(project.packages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'Duplicate.Package',
+          versionSource: 'central',
+          targetFrameworkVersions: [
+            expect.objectContaining({
+              targetFramework: 'net8.0',
+              version: '1.0.0',
+              centralVersionDefinitionCount: 2,
+            }),
+          ],
+        }),
+      ])
+    );
+  });
 
   it('keeps evaluated direct packages and reports when restore graph data is unavailable', async () => {
     const projectPath = path.resolve(__dirname, '..', 'test-fixtures', 'cpm', 'CpmApp', 'CpmApp.csproj');

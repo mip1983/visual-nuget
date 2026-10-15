@@ -401,6 +401,7 @@ function effectivePackageVersion(
     version,
     requestedVersion: version || undefined,
     versionSource,
+    centralVersionDefinitionCount: versionSource === 'central' ? centralVersions.length : undefined,
     packageLevel: 'direct',
     condition: centralVersion?.condition ?? reference.condition,
     versionFilePath,

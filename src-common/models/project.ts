@@ -6,6 +6,7 @@ export interface TargetFrameworkPackageVersion {
   version: string;
   requestedVersion?: string;
   versionSource: PackageVersionSource;
+  centralVersionDefinitionCount?: number;
   packageLevel?: 'direct' | 'transitive';
   condition?: string;
   versionFilePath?: string;
