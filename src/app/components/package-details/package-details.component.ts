@@ -27,6 +27,17 @@ export class PackageDetailsComponent extends BaseComponent implements OnInit {
     return this.selectedVersion.value as CatalogEntry;
   }
 
+  public versionOptionLabel(version: CatalogEntry): string {
+    const warnings: string[] = [];
+    if (version.vulnerabilities?.length) {
+      warnings.push('Vulnerable');
+    }
+    if (version.deprecation) {
+      warnings.push('Deprecated');
+    }
+    return warnings.length > 0 ? `${version.version} ⚠️ ${warnings.join(', ')}` : version.version;
+  }
+
   public get selectedVersionVulnerabilities(): Vulnerability[] | undefined {
     const selectedVersion = this.selectedVersion.value as CatalogEntry | undefined;
     if (selectedVersion?.vulnerabilities !== undefined) {

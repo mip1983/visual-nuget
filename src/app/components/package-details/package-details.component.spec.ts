@@ -186,6 +186,29 @@ describe('PackageDetailsComponent', () => {
     expect(fixture.nativeElement.querySelector('[aria-label="Known package vulnerabilities"]')).toBeNull();
     expect(fixture.nativeElement.querySelector('[aria-label="Package deprecation"]')).toBeNull();
   });
+
+  test('labels vulnerable and deprecated versions in the version dropdown', () => {
+    const versions = [
+      createCatalogEntry('3.0.0'),
+      { ...createCatalogEntry('2.0.0'), vulnerabilities: [{ advisoryUrl: 'https://advisories.example.test/CVE-2', severity: 2 }] },
+      { ...createCatalogEntry('1.5.0'), deprecation: { reasons: ['Legacy'] } },
+      {
+        ...createCatalogEntry('1.0.0'),
+        vulnerabilities: [{ advisoryUrl: 'https://advisories.example.test/CVE-1', severity: 3 }],
+        deprecation: { reasons: ['Legacy'] },
+      },
+    ];
+    selectedPackage.next(createPackage(versions));
+    fixture.detectChanges();
+
+    const options = Array.from(fixture.nativeElement.querySelectorAll('select.drop-down option')) as HTMLOptionElement[];
+    expect(options.map((option) => option.textContent?.trim())).toEqual([
+      '3.0.0',
+      '2.0.0 ⚠️ Vulnerable',
+      '1.5.0 ⚠️ Deprecated',
+      '1.0.0 ⚠️ Vulnerable, Deprecated',
+    ]);
+  });
 });
 
 function createPackage(versions: CatalogEntry[] = []): PackageRowModel {

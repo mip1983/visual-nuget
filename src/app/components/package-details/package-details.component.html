@@ -126,7 +126,7 @@
       <span class="label">Version:</span>
       <select class="drop-down" [formControl]="selectedVersion" [disabled]="isPackageOperationInProgress">
         @for (version of package.versions; track version) {
-          <option [ngValue]="version">{{ version.version }}</option>
+          <option [ngValue]="version">{{ versionOptionLabel(version) }}</option>
         }
       </select>
       <button
